@@ -1,6 +1,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { Navigate, Route, Routes } from "react-router-dom";
 import JsBarcode from "jsbarcode";
 import "./App.css";
 
@@ -48,6 +49,7 @@ type PipCard = {
   sloc: string;
   area: string;
   area_id?: number | null;
+  submitted_at?: string | null;
   lines: MaterialLine[];
 };
 
@@ -334,6 +336,16 @@ function App() {
   const [printCards, setPrintCards] =
     useState<PipCard[]>([]);
 
+  const [reprintOpen, setReprintOpen] =
+    useState(false);
+
+  const [reprintList, setReprintList] = useState<
+    { code: string; area: string; status: string }[]
+  >([]);
+
+  const [reprintCode, setReprintCode] =
+    useState("");
+
   const [blankQuantity, setBlankQuantity] =
     useState(5);
 
@@ -374,17 +386,33 @@ function App() {
 
     loadBatches();
 
-    setAreasLoading(true);
+    const loadProductionAreas = async () => {
+      setAreasLoading(true);
+      setError("");
 
-    api("/production-areas")
-      .then((data: ProductionArea[]) => {
+      try {
+        const data: ProductionArea[] = await api(
+          `/production-areas?location=${encodeURIComponent(sloc)}`
+        );
+
         setProductionAreas(data);
-      })
-      .catch(err => {
-        setError(err.message);
-      })
-      .finally(() => setAreasLoading(false));
-  }, [user]);
+        setSelectedAreaId(previous => {
+          if (previous && data.some(area => String(area.id) === previous)) {
+            return previous;
+          }
+
+          return "";
+        });
+      } catch (err) {
+        setError((err as Error).message);
+        setProductionAreas([]);
+      } finally {
+        setAreasLoading(false);
+      }
+    };
+
+    loadProductionAreas();
+  }, [user, sloc]);
 
   async function loadBatches() {
     try {
@@ -519,6 +547,47 @@ function App() {
     }
   }
 
+  async function generateCardsFromArea() {
+    if (!selectedAreaId) {
+      setError("Select a Production Supply Area.");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const result = await api("/area-cards", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          areaId: Number(selectedAreaId),
+          location: sloc
+        })
+      });
+
+      setBatchId(result.batchId);
+      setFile(null);
+      setCards([]);
+      setShowPreview(false);
+
+      await loadBatches();
+
+      setMessage(
+        `${result.materials} materials matched for ` +
+        `${result.area}. ` +
+        `${result.cards} PIP cards generated.`
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   /* ==================================
      MANAGER: FETCH CARDS
   ================================== */
@@ -636,6 +705,65 @@ function App() {
       setPrintCards(selected);
 
       // Let React render the barcode SVG before print.
+      window.setTimeout(() => {
+        window.print();
+      }, 500);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* ==================================
+     MANAGER: REPRINT PIP CARD
+  ================================== */
+
+  async function openReprintModal() {
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const list: {
+        code: string;
+        area: string;
+        status: string;
+      }[] = await api("/reprint/cards");
+
+      if (!list.length) {
+        setError("No PIP cards found to reprint.");
+        return;
+      }
+
+      setReprintList(list);
+      setReprintCode(list[0].code);
+      setReprintOpen(true);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitReprint() {
+    if (!reprintCode) {
+      setError("Select a PIP card to reprint.");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const card: PipCard = await api(
+        `/reprint/cards/${encodeURIComponent(reprintCode)}`
+      );
+
+      setReprintOpen(false);
+      setPrintCards([card]);
+
       window.setTimeout(() => {
         window.print();
       }, 500);
@@ -805,70 +933,137 @@ function App() {
 
   if (!user) {
     return (
-      <main className="login-screen">
-        <form className="login-box" onSubmit={login}>
-          <img
-            src="/OIP.webp"
-            alt="ABB Logo"
-            className="login-logo"
-          />
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <main className="login-screen">
+              <form className="login-box" onSubmit={login}>
+                <img
+                  src="/OIP.webp"
+                  alt="ABB Logo"
+                  className="login-logo"
+                />
 
-          <h1>Warehouse Inventory Audit</h1>
+                <h1>Warehouse Inventory Audit</h1>
 
-          <p className="muted">
-            ABB Internal Inventory Management
-          </p>
+                <p className="muted">
+                  ABB Internal Inventory Management
+                </p>
 
-          <label>Username</label>
+                <label>Username</label>
 
-          <input
-            value={username}
-            onChange={event =>
-              setUsername(event.target.value)
-            }
-            autoComplete="username"
-            placeholder="Enter username"
-            required
-          />
+                <input
+                  value={username}
+                  onChange={event =>
+                    setUsername(event.target.value)
+                  }
+                  autoComplete="username"
+                  placeholder="Enter username"
+                  required
+                />
 
-          <label>Password</label>
+                <label>Password</label>
 
-          <input
-            type="password"
-            value={password}
-            onChange={event =>
-              setPassword(event.target.value)
-            }
-            autoComplete="current-password"
-            placeholder="Enter password"
-            required
-          />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={event =>
+                    setPassword(event.target.value)
+                  }
+                  autoComplete="current-password"
+                  placeholder="Enter password"
+                  required
+                />
 
-          {error && (
-            <p className="error">{error}</p>
-          )}
+                {error && (
+                  <p className="error">{error}</p>
+                )}
 
-          <button
-            type="submit"
-            className="primary"
-            disabled={busy}
-          >
-            {busy ? "Signing in..." : "Sign In"}
-          </button>
+                <button
+                  type="submit"
+                  className="primary"
+                  disabled={busy}
+                >
+                  {busy ? "Signing in..." : "Sign In"}
+                </button>
 
-          <small>
-            Authorized warehouse personnel only
-          </small>
-        </form>
-      </main>
+                <small>
+                  Authorized warehouse personnel only
+                </small>
+              </form>
+            </main>
+          }
+        />
+
+        <Route
+          path="*"
+          element={<Navigate to="/login" replace />}
+        />
+      </Routes>
     );
   }
 
-  /* ==================================
-     MAIN DASHBOARD
-  ================================== */
+  const loginScreen = (
+    <main className="login-screen">
+      <form className="login-box" onSubmit={login}>
+        <img
+          src="/OIP.webp"
+          alt="ABB Logo"
+          className="login-logo"
+        />
 
-  return (
+        <h1>Warehouse Inventory Audit</h1>
+
+        <p className="muted">
+          ABB Internal Inventory Management
+        </p>
+
+        <label>Username</label>
+
+        <input
+          value={username}
+          onChange={event =>
+            setUsername(event.target.value)
+          }
+          autoComplete="username"
+          placeholder="Enter username"
+          required
+        />
+
+        <label>Password</label>
+
+        <input
+          type="password"
+          value={password}
+          onChange={event =>
+            setPassword(event.target.value)
+          }
+          autoComplete="current-password"
+          placeholder="Enter password"
+          required
+        />
+
+        {error && (
+          <p className="error">{error}</p>
+        )}
+
+        <button
+          type="submit"
+          className="primary"
+          disabled={busy}
+        >
+          {busy ? "Signing in..." : "Sign In"}
+        </button>
+
+        <small>
+          Authorized warehouse personnel only
+        </small>
+      </form>
+    </main>
+  );
+
+  const dashboardScreen = (
     <div className="app-shell">
 
       {/* SIDEBAR */}
@@ -911,8 +1106,8 @@ function App() {
           </div>
 
           <div className="user-information">
-            <strong>{user.username}</strong>
-            <span>{user.role.toUpperCase()}</span>
+            <strong>{user!.username}</strong>
+            <span>{user!.role.toUpperCase()}</span>
           </div>
         </header>
 
@@ -1015,6 +1210,17 @@ function App() {
                 <div className="button-row">
                   <button
                     className="primary"
+                    onClick={generateCardsFromArea}
+                    disabled={
+                      busy ||
+                      !selectedAreaId
+                    }
+                  >
+                    Generate PIP Cards from PSA Data
+                  </button>
+
+                  <button
+                    className="secondary"
                     onClick={uploadExcel}
                     disabled={
                       busy ||
@@ -1084,6 +1290,14 @@ function App() {
                   >
                     Print Filled Cards
                   </button>
+
+                  <button
+                    className="secondary"
+                    onClick={openReprintModal}
+                    disabled={busy}
+                  >
+                    Reprint PIP Card
+                  </button>
                 </div>
               </section>
 
@@ -1133,6 +1347,71 @@ function App() {
                   </button>
                 </div>
               </section>
+
+              {/* REPRINT MODAL */}
+
+              {reprintOpen && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => setReprintOpen(false)}
+                >
+                  <div
+                    className="modal"
+                    onClick={event =>
+                      event.stopPropagation()
+                    }
+                  >
+                    <h3>Reprint PIP Card</h3>
+
+                    <p className="muted">
+                      Select a previously generated PIP
+                      card to regenerate and print it.
+                    </p>
+
+                    <label>PIP Card</label>
+
+                    <select
+                      value={reprintCode}
+                      onChange={event =>
+                        setReprintCode(event.target.value)
+                      }
+                    >
+                      {reprintList.map(card => (
+                        <option
+                          key={card.code}
+                          value={card.code}
+                        >
+                          {card.code}
+                          {" — "}
+                          {card.area}
+                          {" ("}
+                          {card.status}
+                          {")"}
+                        </option>
+                      ))}
+                    </select>
+
+                    <div className="button-row">
+                      <button
+                        className="primary"
+                        onClick={submitReprint}
+                        disabled={busy || !reprintCode}
+                      >
+                        Submit
+                      </button>
+
+                      <button
+                        className="secondary"
+                        onClick={() =>
+                          setReprintOpen(false)
+                        }
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* PIP CARD PREVIEW */}
 
@@ -1231,11 +1510,19 @@ function App() {
                     </div>
 
                     <span className="card-type">
-                      {selectedCard.kind === "blank"
-                        ? "Blank Card"
-                        : "Material Card"}
+                      {selectedCard.submitted_at
+                        ? "Confirmed / Read Only"
+                        : selectedCard.kind === "blank"
+                          ? "Blank Card"
+                          : "Material Card"}
                     </span>
                   </div>
+
+                  {selectedCard.submitted_at && (
+                    <div className="success-message">
+                      This card has already been confirmed. The saved counts are shown below and are read-only.
+                    </div>
+                  )}
 
                   <div className="table-scroll">
                     <table className="entry-table">
@@ -1258,6 +1545,7 @@ function App() {
 
                           const isBlank =
                             selectedCard.kind === "blank";
+                          const isReadOnly = Boolean(selectedCard.submitted_at);
 
                           return (
                             <tr key={line.id}>
@@ -1271,7 +1559,7 @@ function App() {
                                 ] as const
                               ).map(field => (
                                 <td key={field}>
-                                  {isBlank ? (
+                                  {isBlank && !isReadOnly ? (
                                     <input
                                       value={entry[field]}
                                       onChange={event =>
@@ -1282,6 +1570,7 @@ function App() {
                                         )
                                       }
                                       placeholder={field}
+                                      readOnly={isReadOnly}
                                     />
                                   ) : (
                                     entry[field] || "—"
@@ -1294,7 +1583,7 @@ function App() {
                               </td>
 
                               <td>
-                                {isBlank ? (
+                                {isBlank && !isReadOnly ? (
                                   <input
                                     value={entry.bin}
                                     onChange={event =>
@@ -1305,6 +1594,7 @@ function App() {
                                       )
                                     }
                                     placeholder="Bin"
+                                    readOnly={isReadOnly}
                                   />
                                 ) : (
                                   entry.bin || "—"
@@ -1312,20 +1602,24 @@ function App() {
                               </td>
 
                               <td>
-                                <input
-                                  type="number"
-                                  min="0"
-                                  step="1"
-                                  value={entry.qty}
-                                  onChange={event =>
-                                    updateEntry(
-                                      line.id,
-                                      "qty",
-                                      event.target.value
-                                    )
-                                  }
-                                  placeholder="Qty"
-                                />
+                                {isReadOnly ? (
+                                  <span>{entry.qty || "0"}</span>
+                                ) : (
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    step="1"
+                                    value={entry.qty}
+                                    onChange={event =>
+                                      updateEntry(
+                                        line.id,
+                                        "qty",
+                                        event.target.value
+                                      )
+                                    }
+                                    placeholder="Qty"
+                                  />
+                                )}
                               </td>
                             </tr>
                           );
@@ -1338,9 +1632,9 @@ function App() {
                     <button
                       className="primary"
                       onClick={saveCounts}
-                      disabled={busy}
+                      disabled={busy || Boolean(selectedCard.submitted_at)}
                     >
-                      Save Physical Counts
+                      {selectedCard.submitted_at ? "Confirmed - Read Only" : "Save Physical Counts"}
                     </button>
                   </div>
                 </section>
@@ -1379,6 +1673,31 @@ function App() {
         </div>
       )}
     </div>
+  );
+
+  return (
+    <Routes>
+      <Route
+        path="/login"
+        element={
+          user ? <Navigate to="/" replace /> : loginScreen
+        }
+      />
+
+      <Route
+        path="/"
+        element={
+          user ? dashboardScreen : <Navigate to="/login" replace />
+        }
+      />
+
+      <Route
+        path="*"
+        element={
+          <Navigate to={user ? "/" : "/login"} replace />
+        }
+      />
+    </Routes>
   );
 }
 

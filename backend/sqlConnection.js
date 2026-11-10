@@ -1,12 +1,13 @@
 
+const path = require("node:path");
 const sql = require("mssql");
-require("dotenv").config();
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const config = {
-  server: process.env.SQL_SERVER,
-  database: process.env.SQL_DATABASE,
-  user: process.env.SQL_USER,
-  password: process.env.SQL_PASSWORD,
+  server: process.env.SQL_SERVER || "10.90.104.27",
+  database: process.env.SQL_DATABASE || "Engineering",
+  user: process.env.SQL_USER || "MES_USER",
+  password: process.env.SQL_PASSWORD || "Office26",
 
   options: {
     encrypt: true,
@@ -38,4 +39,5 @@ function getSqlPool() {
   return poolPromise;
 }
 
-module.exports = { getSqlPool };
+module.exports = { config, getSqlPool };
+module.exports.default = config;
