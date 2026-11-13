@@ -703,6 +703,32 @@
 }
 
 /* =====================================
+   PO CONTROLS
+===================================== */
+
+.po-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 12px 0 16px;
+}
+
+.po-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.po-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #c50010;
+  cursor: pointer;
+}
+
+/* =====================================
    MODAL
 ===================================== */
 

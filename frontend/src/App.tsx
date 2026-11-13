@@ -346,6 +346,17 @@ function App() {
   const [reprintCode, setReprintCode] =
     useState("");
 
+  const [poChecked, setPoChecked] = useState(false);
+
+  const [poLines, setPoLines] = useState<
+    {
+      material: string;
+      description: string;
+      printedQty: number;
+      qty: string;
+    }[]
+  >([]);
+
   const [blankQuantity, setBlankQuantity] =
     useState(5);
 
@@ -630,11 +641,6 @@ function App() {
   ================================== */
 
   async function generateBlankCards() {
-    if (!batchId) {
-      setError("Select an audit batch.");
-      return;
-    }
-
     if (
       !Number.isInteger(blankQuantity) ||
       blankQuantity < 1 ||
@@ -655,18 +661,25 @@ function App() {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          batchId,
-          quantity: blankQuantity
+          quantity: blankQuantity,
+          location: sloc,
+          areaId: selectedAreaId ? Number(selectedAreaId) : null
         })
       });
 
-      const updated = await fetchCards();
+      const updatedBatches: Batch[] = await api("/batches");
+      setBatches(updatedBatches);
+      setBatchId(result.batchId);
+
+      const updated: PipCard[] = await api(
+        `/batches/${result.batchId}/cards`
+      );
 
       setCards(updated);
       setShowPreview(true);
 
       setMessage(
-        `${result.generated.length} blank cards created.`
+        `${result.generated.length} blank cards created for ${result.area}.`
       );
     } catch (err) {
       setError((err as Error).message);
@@ -808,6 +821,8 @@ function App() {
       }
 
       setEntries(initial);
+      setPoChecked(false);
+      setPoLines([]);
     } catch (err) {
       setSelectedCard(null);
       setError((err as Error).message);
@@ -830,12 +845,84 @@ function App() {
     }));
   }
 
+  function updatePoQty(index: number, value: string) {
+    setPoLines(previous =>
+      previous.map((line, i) =>
+        i === index ? { ...line, qty: value } : line
+      )
+    );
+  }
+
+  /* ==================================
+     AUDITOR: LOAD PRODUCTION ORDER BOM
+  ================================== */
+
+  async function loadBom() {
+    if (!selectedCard) return;
+
+    const firstLine = selectedCard.lines[0];
+    const orderNumber = firstLine
+      ? (entries[firstLine.id]?.material || "").trim()
+      : "";
+
+    if (!orderNumber) {
+      setError("Enter the production order number in row 1.");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const rows: {
+        material: string;
+        description: string;
+        requirementQty: number;
+        storageLocation: string;
+        uom: string;
+      }[] = await api(
+        `/po/${encodeURIComponent(orderNumber)}`
+      );
+
+      setPoLines(
+        rows.map(row => ({
+          material: row.material,
+          description: row.description,
+          printedQty: Number(row.requirementQty ?? 0),
+          qty: ""
+        }))
+      );
+
+      setMessage(
+        `Loaded ${rows.length} materials for order ${orderNumber}. ` +
+        "Verify the actual quantities."
+      );
+    } catch (err) {
+      const text = (err as Error).message;
+      setPoLines([]);
+
+      if (text.toLowerCase().includes("no order found")) {
+        window.alert(text);
+      } else {
+        setError(text);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   /* ==================================
      AUDITOR: SAVE PHYSICAL COUNTS
   ================================== */
 
   async function saveCounts() {
     if (!selectedCard) return;
+
+    const firstLine = selectedCard.lines[0];
+    const poOrderNumber = poChecked && firstLine
+      ? (entries[firstLine.id]?.material || "").trim()
+      : "";
 
     const submitted = selectedCard.lines.map(line => {
       const entry = entries[line.id];
@@ -851,7 +938,37 @@ function App() {
       };
     });
 
-    const invalid = submitted.some(item => {
+    if (poChecked) {
+      if (!poOrderNumber) {
+        setError("Enter the production order number in row 1.");
+        return;
+      }
+
+      const countedPo = poLines.filter(
+        line => line.qty.trim() !== ""
+      );
+
+      if (!countedPo.length) {
+        setError(
+          "Load the BOM and enter at least one actual quantity."
+        );
+        return;
+      }
+
+      const badPo = countedPo.some(line => {
+        const value = Number(line.qty);
+        return !Number.isSafeInteger(value) || value < 0;
+      });
+
+      if (badPo) {
+        setError(
+          "Enter valid whole-number actual quantities for the BOM materials."
+        );
+        return;
+      }
+    }
+
+    const invalid = !poChecked && submitted.some(item => {
       const emptyBlankRow =
         selectedCard.kind === "blank" &&
         !item.material.trim() &&
@@ -896,7 +1013,21 @@ function App() {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            lines: submitted
+            lines: submitted,
+            ...(poChecked
+              ? {
+                  po: {
+                    orderNumber: poOrderNumber,
+                    lines: poLines
+                      .filter(line => line.qty.trim() !== "")
+                      .map(line => ({
+                        material: line.material,
+                        qty: Number(line.qty),
+                        printedQty: line.printedQty
+                      }))
+                  }
+                }
+              : {})
           })
         }
       );
@@ -908,6 +1039,8 @@ function App() {
       setSelectedCard(null);
       setCardSearch("");
       setEntries({});
+      setPoChecked(false);
+      setPoLines([]);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -1331,7 +1464,7 @@ function App() {
                   <button
                     className="primary"
                     onClick={generateBlankCards}
-                    disabled={busy || !batchId}
+                    disabled={busy}
                   >
                     Generate Blank Cards
                   </button>
@@ -1524,6 +1657,37 @@ function App() {
                     </div>
                   )}
 
+                  {selectedCard.kind === "blank" &&
+                    !selectedCard.submitted_at && (
+                      <div className="po-controls">
+                        <label className="po-toggle">
+                          <input
+                            type="checkbox"
+                            checked={poChecked}
+                            onChange={event => {
+                              setPoChecked(
+                                event.target.checked
+                              );
+                              if (!event.target.checked) {
+                                setPoLines([]);
+                              }
+                            }}
+                          />
+                          Production Order (PO)
+                        </label>
+
+                        {poChecked && (
+                          <button
+                            className="secondary"
+                            onClick={loadBom}
+                            disabled={busy}
+                          >
+                            Load BOM
+                          </button>
+                        )}
+                      </div>
+                    )}
+
                   <div className="table-scroll">
                     <table className="entry-table">
                       <thead>
@@ -1546,6 +1710,10 @@ function App() {
                           const isBlank =
                             selectedCard.kind === "blank";
                           const isReadOnly = Boolean(selectedCard.submitted_at);
+                          const isPoLocked =
+                            poChecked && line.line_no !== 1;
+                          const isPoOrderRow =
+                            poChecked && line.line_no === 1;
 
                           return (
                             <tr key={line.id}>
@@ -1569,8 +1737,16 @@ function App() {
                                           event.target.value
                                         )
                                       }
-                                      placeholder={field}
-                                      readOnly={isReadOnly}
+                                      placeholder={
+                                        isPoOrderRow &&
+                                        field === "material"
+                                          ? "Production Order #"
+                                          : field
+                                      }
+                                      readOnly={
+                                        isReadOnly || isPoLocked
+                                      }
+                                      disabled={isPoLocked}
                                     />
                                   ) : (
                                     entry[field] || "—"
@@ -1594,7 +1770,10 @@ function App() {
                                       )
                                     }
                                     placeholder="Bin"
-                                    readOnly={isReadOnly}
+                                    readOnly={
+                                      isReadOnly || isPoLocked
+                                    }
+                                    disabled={isPoLocked}
                                   />
                                 ) : (
                                   entry.bin || "—"
@@ -1618,6 +1797,9 @@ function App() {
                                       )
                                     }
                                     placeholder="Qty"
+                                    disabled={
+                                      isPoLocked || isPoOrderRow
+                                    }
                                   />
                                 )}
                               </td>
@@ -1627,6 +1809,50 @@ function App() {
                       </tbody>
                     </table>
                   </div>
+
+                  {poChecked && poLines.length > 0 && (
+                    <div className="table-scroll">
+                      <h4>Production Order BOM</h4>
+
+                      <table className="entry-table">
+                        <thead>
+                          <tr>
+                            <th>No.</th>
+                            <th>Material</th>
+                            <th>Description</th>
+                            <th>Printed Qty</th>
+                            <th>Actual Qty</th>
+                          </tr>
+                        </thead>
+
+                        <tbody>
+                          {poLines.map((line, index) => (
+                            <tr key={`${line.material}-${index}`}>
+                              <td>{index + 1}</td>
+                              <td>{line.material}</td>
+                              <td>{line.description}</td>
+                              <td>{line.printedQty}</td>
+                              <td>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  value={line.qty}
+                                  onChange={event =>
+                                    updatePoQty(
+                                      index,
+                                      event.target.value
+                                    )
+                                  }
+                                  placeholder="Qty"
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
 
                   <div className="button-row">
                     <button

@@ -308,7 +308,7 @@ async function getCard(code) {
         LastUpdate AS created_at,
         0 AS id,
         0 AS batch_id,
-        'filled' AS kind,
+        CASE WHEN PIPNum LIKE '%-BL%' THEN 'blank' ELSE 'filled' END AS kind,
         CONVERT(NVARCHAR(32), NULL) AS sloc,
         NULL AS area_id
       FROM INV.PIP
@@ -358,7 +358,14 @@ async function getLines(code) {
       ORDER BY t.TicketNumber
     `);
 
-  return result.recordset || [];
+  const isBlank = normalized.includes("-BL");
+  return (result.recordset || []).map((line, index) => ({
+    ...line,
+    line_no: index + 1,
+    id: Number(line.id),
+    description: isBlank ? "" : line.description || "",
+    bin: isBlank ? "" : line.bin || ""
+  }));
 }
 
 function buildPipCardCode({ sloc, areaId, batchId, pageNumber }) {
@@ -410,7 +417,7 @@ function toSqlPipNum(cardCode) {
   return value;
 }
 
-async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], cardIndex = 0 }) {
+async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], cardIndex = 0, poOrder = "", poLines = [] }) {
   const pool = await getSqlPool();
   const sqlPipNum = toSqlPipNum(cardCode);
 
@@ -443,48 +450,69 @@ async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], car
 
   const rowsToInsert = [];
 
-  for (const [index, line] of (Array.isArray(lines) ? lines : []).entries()) {
-    const material = clean(line.material || line.Material || "");
-    const rawQty = line.physical_qty ?? line.qty;
-    const hasQty = rawQty !== null && rawQty !== undefined && rawQty !== "";
-    const qty = hasQty ? Number(rawQty) : NaN;
+  if (poOrder && Array.isArray(poLines) && poLines.length) {
+    const primaryTicketNumber = persistedTicketNumbers[0] || resolveTicketNumber({ cardIndex, lineNo: 1 });
 
-    if (!material || !hasQty || !Number.isFinite(qty) || qty < 0) {
-      continue;
+    for (const poLine of poLines) {
+      const material = clean(poLine.material);
+      const qty = Number(poLine.qty);
+
+      if (!material || !Number.isFinite(qty) || qty < 0) {
+        continue;
+      }
+
+      rowsToInsert.push({
+        TicketNumber: primaryTicketNumber,
+        Material: material,
+        Status: "confirmed",
+        qty,
+        printedQty: Number(poLine.printedQty ?? 0)
+      });
     }
-
-    const persistedTicketNumber = Number(persistedTicketNumbers[index] ?? 0);
-    const fallbackTicketNumber = Number(line.line_no ?? line.lineNo ?? line.TicketNumber ?? 0);
-    const ticketNumber = persistedTicketNumber > 0 ? persistedTicketNumber : fallbackTicketNumber;
-
-    if (!ticketNumber) {
-      continue;
-    }
-
-    rowsToInsert.push({
-      TicketNumber: ticketNumber,
-      Material: material,
-      Status: "confirmed",
-      qty
-    });
-  }
-
-  if (!rowsToInsert.length && ticketRows.length) {
-    for (const ticketRow of ticketRows) {
-      const material = clean(ticketRow.Material || "");
-      const ticketNumber = Number(ticketRow.TicketNumber ?? 0);
-      const matchedLine = lineLookup.get(String(ticketNumber)) || lineLookup.get(material) || {};
-      const rawQty = matchedLine.physical_qty ?? matchedLine.qty;
+  } else {
+    for (const [index, line] of (Array.isArray(lines) ? lines : []).entries()) {
+      const material = clean(line.material || line.Material || "");
+      const rawQty = line.physical_qty ?? line.qty;
       const hasQty = rawQty !== null && rawQty !== undefined && rawQty !== "";
       const qty = hasQty ? Number(rawQty) : NaN;
 
-      if (material && hasQty && Number.isFinite(qty) && qty >= 0) {
-        rowsToInsert.push({
-          TicketNumber: ticketNumber,
-          Material: material,
-          Status: "confirmed",
-          qty
-        });
+      if (!material || !hasQty || !Number.isFinite(qty) || qty < 0) {
+        continue;
+      }
+
+      const persistedTicketNumber = Number(persistedTicketNumbers[index] ?? 0);
+      const fallbackTicketNumber = Number(line.line_no ?? line.lineNo ?? line.TicketNumber ?? 0);
+      const ticketNumber = persistedTicketNumber > 0 ? persistedTicketNumber : fallbackTicketNumber;
+
+      if (!ticketNumber) {
+        continue;
+      }
+
+      rowsToInsert.push({
+        TicketNumber: ticketNumber,
+        Material: material,
+        Status: "confirmed",
+        qty
+      });
+    }
+
+    if (!rowsToInsert.length && ticketRows.length) {
+      for (const ticketRow of ticketRows) {
+        const material = clean(ticketRow.Material || "");
+        const ticketNumber = Number(ticketRow.TicketNumber ?? 0);
+        const matchedLine = lineLookup.get(String(ticketNumber)) || lineLookup.get(material) || {};
+        const rawQty = matchedLine.physical_qty ?? matchedLine.qty;
+        const hasQty = rawQty !== null && rawQty !== undefined && rawQty !== "";
+        const qty = hasQty ? Number(rawQty) : NaN;
+
+        if (material && hasQty && Number.isFinite(qty) && qty >= 0) {
+          rowsToInsert.push({
+            TicketNumber: ticketNumber,
+            Material: material,
+            Status: "confirmed",
+            qty
+          });
+        }
       }
     }
   }
@@ -545,7 +573,12 @@ async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], car
       .input("backflush", sql.NVarChar, backflush)
       .input("materialCost", sql.Decimal(12, 4), totalCost)
       .input("materialLocation", sql.NVarChar, materialLocation)
-      .input("qtyWithdrawn", sql.Decimal(10, 3), Number(qty));
+      .input("qtyWithdrawn", sql.Decimal(10, 3), Number(qty))
+      .input("productionOrder", sql.VarChar(12), poOrder ? poOrder.slice(0, 12) : null)
+      .input("peggedRequirement", sql.VarChar(32),
+        ticketRow.printedQty === undefined || ticketRow.printedQty === null
+          ? null
+          : String(ticketRow.printedQty).slice(0, 32));
 
     await insertRequest.query(`
       INSERT INTO INV.BOM_Complex_Catalog (
@@ -580,7 +613,7 @@ async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], car
       VALUES (
         GETDATE(),
         @piCard,
-        NULL,
+        @productionOrder,
         @status,
         @employeeAlias,
         @material,
@@ -591,7 +624,7 @@ async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], car
         @unitOfMeasure,
         @bulkMaterial,
         NULL,
-        NULL,
+        @peggedRequirement,
         NULL,
         @materialCost,
         NULL,
@@ -617,7 +650,7 @@ async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], car
   }
 }
 
-async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName, lines = [], pipStatus = "pending", cardIndex = 0 }) {
+async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName, lines = [], pipStatus = "pending", cardIndex = 0, poOrder = "", poLines = [], ticketNumbers = [] }) {
   const pool = await getSqlPool();
   const sqlPipNum = toSqlPipNum(cardCode);
   const pipStatusValue = String(pipStatus || "pending").toLowerCase() === "confirmed" ? "confirmed" : "pending";
@@ -706,10 +739,11 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
   for (const [index, line] of lines.entries()) {
     const material = clean(line.material || line.Material || "");
     const fallbackTicketNumber = resolveTicketNumber({ cardIndex, lineNo: line.line_no ?? line.lineNo ?? 0 });
-    const actualTicketNumber = currentTicketNumbers[index] || fallbackTicketNumber;
+    const actualTicketNumber = ticketNumbers[index] || currentTicketNumbers[index] || fallbackTicketNumber;
     const ticketNumber = Number(actualTicketNumber) || 0;
     const lineIsVoid = !!(line.is_void || line.isVoid);
     const ticketStatus = lineIsVoid ? "voided" : (pipStatusValue === "confirmed" ? "confirmed" : "pending");
+    const typeOfAdd = poOrder && index === 0 && !lineIsVoid ? "PO" : determineTicketType(material, lineIsVoid);
 
     if (!material && ticketNumber === 0) continue;
 
@@ -722,7 +756,7 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
       await pool.request()
         .input("pipNum", sql.NVarChar, sqlPipNum)
         .input("status", sql.NVarChar, ticketStatus)
-        .input("typeOfAdd", sql.NVarChar, determineTicketType(material, lineIsVoid))
+        .input("typeOfAdd", sql.NVarChar, typeOfAdd)
         .input("lastUpdate", sql.DateTime, new Date())
         .input("ticketNumber", sql.Int, ticketNumber || 0)
         .input("material", sql.NVarChar, material)
@@ -746,7 +780,7 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
       await pool.request()
         .input("pipNum", sql.NVarChar, sqlPipNum)
         .input("status", sql.NVarChar, ticketStatus)
-        .input("typeOfAdd", sql.NVarChar, determineTicketType(material, lineIsVoid))
+        .input("typeOfAdd", sql.NVarChar, typeOfAdd)
         .input("lastUpdate", sql.DateTime, new Date())
         .input("ticketNumber", sql.Int, ticketNumber || 0)
         .input("material", sql.NVarChar, material)
@@ -782,7 +816,9 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
     cardCode,
     userName,
     lines,
-    cardIndex
+    cardIndex,
+    poOrder,
+    poLines
   });
 }
 
@@ -1079,6 +1115,51 @@ app.get("/api/sql/order", async (req, res) => {
       message: error.message || "Unable to load order from SQL Server"
     });
     res.status(503).json({ message: "Unable to load order from SQL Server" });
+  }
+});
+
+app.get("/api/po/:orderNum", requireLogin, async (req, res) => {
+  const orderNum = clean(req.params.orderNum);
+
+  if (!orderNum) {
+    return res.status(400).json({ message: "Production order number is required" });
+  }
+
+  try {
+    const pool = await getSqlPool();
+    const result = await pool.request()
+      .input("orderNum", sql.VarChar(12), orderNum)
+      .query(`
+        SELECT
+          Material AS material,
+          COALESCE(Material_Description, '') AS description,
+          COALESCE(Requirement_Qty, 0) AS requirementQty,
+          COALESCE(Storage_Location, '') AS storageLocation,
+          COALESCE(UnitOfEntry, 'EA') AS uom
+        FROM INV.RAW_CATALOG
+        WHERE Production_Order = @orderNum
+        ORDER BY TRY_CAST(Item_Component AS INT), ID
+      `);
+
+    if (!result.recordset.length) {
+      writeLog({
+        activity: "order_not_found",
+        userName: req.session.user?.username,
+        message: `No BOM found for production order ${orderNum}`
+      });
+      return res.status(404).json({ message: `No order found for ${orderNum}` });
+    }
+
+    writeLog({
+      activity: "bom_loaded",
+      userName: req.session.user?.username,
+      message: `Loaded ${result.recordset.length} materials for production order ${orderNum}`
+    });
+
+    res.json(result.recordset);
+  } catch (error) {
+    console.error("PO BOM load failed:", error.message);
+    res.status(503).json({ message: "Unable to load production order BOM" });
   }
 });
 
@@ -1530,9 +1611,12 @@ app.get("/api/batches", requireManager, (req, res) => {
 app.post(
   "/api/blank-cards",
   requireManager,
-  (req, res) => {
-    const batchId = Number(req.body?.batchId);
+  async (req, res) => {
     const quantity = Number(req.body?.quantity);
+    const location = clean(req.body?.location);
+    const rawAreaId = req.body?.areaId;
+    const hasSelectedArea = rawAreaId !== null && rawAreaId !== undefined && String(rawAreaId).trim() !== "";
+    const areaId = hasSelectedArea ? Number(rawAreaId) : null;
 
     if (
       !Number.isInteger(quantity) ||
@@ -1544,66 +1628,137 @@ app.post(
       });
     }
 
-    const batch = getGeneratedBatch(batchId);
-
-    if (!batch) {
-      return res.status(404).json({
-        message: "Audit batch not found"
+    if (!LOCATIONS.includes(location)) {
+      return res.status(400).json({
+        message: "Invalid Storage Location"
       });
     }
 
-    const previous = batch.cards.filter(card => card.kind === "blank").length;
-    const generated = [];
-    const prefix = cardPrefix(batch);
-
-    for (let i = 1; i <= quantity; i++) {
-      const code = prefix + "-BL" + String(previous + i).padStart(3, "0");
-      const card = {
-        id: nextCardId++,
-        batch_id: batch.id,
-        code,
-        kind: "blank",
-        submitted_at: null,
-        created_at: new Date().toISOString(),
-        sloc: batch.sloc,
-        area: batch.area,
-        area_id: batch.area_id,
-        lines: Array.from({ length: 10 }, (_, lineIndex) => ({
-          id: nextLineId++,
-          card_id: 0,
-          line_no: lineIndex + 1,
-          material: "",
-          description: "",
-          bin: "",
-          plant: "",
-          stock_category: "",
-          batch: "",
-          uom: "EA",
-          sap_qty: null,
-          physical_qty: null,
-          is_void: 0,
-          entered_by: null,
-          entered_at: null
-        }))
-      };
-
-      card.lines = card.lines.map(line => ({
-        ...line,
-        card_id: card.id
-      }));
-
-      batch.cards.push(card);
-      generated.push(code);
+    if (hasSelectedArea && (!Number.isSafeInteger(areaId) || areaId <= 0)) {
+      return res.status(400).json({
+        message: "Invalid Production Supply Area"
+      });
     }
 
-    writeLog({
-      activity: "blank_cards_generated",
-      userName: req.session.user?.username,
-      pip: batch.area,
-      message: `Generated ${quantity} blank cards for batch ${batchId}`
-    });
+    let batch = null;
+    let areaName = "None";
+    let subAreaName = "None";
 
-    res.json({ generated });
+    try {
+      if (hasSelectedArea) {
+        const area = await findArea(areaId);
+        if (!area || clean(area.InventoryLocation) !== location) {
+          return res.status(400).json({
+            message: "Selected Production Supply Area is not available for this Storage Location"
+          });
+        }
+
+        areaName = clean(area.strName || area.SubArea || area.Area) || "None";
+        subAreaName = clean(area.SubArea || area.Area || area.strName) || areaName;
+      }
+
+      batch = addGeneratedBatch({
+        sloc: location,
+        area: areaName,
+        areaId
+      });
+
+      const pool = await getSqlPool();
+      const ticketResult = await pool.request().query(
+        "SELECT ISNULL(MAX(TicketNumber), 0) AS maxTicketNumber FROM INV.Tickets"
+      );
+      let nextTicketNumber = Number(ticketResult.recordset[0]?.maxTicketNumber || 0) + 1;
+
+      const generated = [];
+      const createdCards = [];
+      const prefix = cardPrefix(batch);
+      const previousCards = await pool.request()
+        .input("codePattern", sql.VarChar(50), `${prefix}-BL%`)
+        .query("SELECT PIPNum FROM INV.PIP WHERE PIPNum LIKE @codePattern");
+      const previous = (previousCards.recordset || []).reduce((max, row) => {
+        const match = String(row.PIPNum || "").match(/-BL(\d+)$/i);
+        return match ? Math.max(max, Number(match[1])) : max;
+      }, 0);
+
+      for (let i = 1; i <= quantity; i++) {
+        const code = prefix + "-BL" + String(previous + i).padStart(3, "0");
+        const card = {
+          id: nextCardId++,
+          batch_id: batch.id,
+          code,
+          kind: "blank",
+          submitted_at: null,
+          created_at: new Date().toISOString(),
+          sloc: batch.sloc,
+          area: batch.area,
+          area_id: batch.area_id,
+          lines: Array.from({ length: 10 }, (_, lineIndex) => ({
+            id: nextLineId++,
+            card_id: 0,
+            line_no: lineIndex + 1,
+            material: "",
+            description: "",
+            bin: "",
+            plant: "",
+            stock_category: "",
+            batch: "",
+            uom: "EA",
+            sap_qty: null,
+            physical_qty: null,
+            is_void: 0,
+            entered_by: null,
+            entered_at: null
+          }))
+        };
+
+        card.lines = card.lines.map(line => ({
+          ...line,
+          card_id: card.id
+        }));
+
+        createdCards.push({
+          card,
+          ticketNumbers: Array.from({ length: card.lines.length }, () => nextTicketNumber++)
+        });
+        generated.push(code);
+      }
+
+      for (const { card, ticketNumbers } of createdCards) {
+        await syncCardToInventoryTables({
+          cardCode: card.code,
+          areaName: batch.area,
+          subArea: subAreaName,
+          userName: req.session.user?.username,
+          lines: card.lines,
+          ticketNumbers
+        });
+      }
+
+      batch.cards.push(...createdCards.map(({ card }) => card));
+
+      writeLog({
+        activity: "blank_cards_generated",
+        userName: req.session.user?.username,
+        pip: batch.area,
+        message: `Generated and persisted ${quantity} standalone blank cards for SLoc ${location}`
+      });
+
+      res.json({ batchId: batch.id, area: batch.area, generated });
+    } catch (error) {
+      if (batch) {
+        generatedBatches.delete(batch.id);
+      }
+      console.error("Blank card persistence failed:", error.message);
+      writeLog({
+        activity: "error_generating_cards",
+        userName: req.session.user?.username,
+        pip: batch?.area || areaName,
+        message: `Blank card persistence failed: ${error.message}`
+      });
+      res.status(500).json({
+        message: `Unable to persist blank cards to INV.PIP and INV.Tickets: ${error.message}`
+      });
+    }
   }
 );
 
@@ -1882,6 +2037,33 @@ app.post(
       });
     }
 
+    const poPayload = req.body?.po && typeof req.body.po === "object" ? req.body.po : null;
+    const poMode = !!poPayload;
+    const poOrderNumber = poMode ? clean(poPayload.orderNumber).slice(0, 12) : "";
+    const poLines = poMode && Array.isArray(poPayload.lines)
+      ? poPayload.lines
+          .map(line => ({
+            material: clean(line?.material),
+            qty: Number(line?.qty),
+            printedQty: Number(line?.printedQty ?? 0)
+          }))
+          .filter(line => line.material && Number.isSafeInteger(line.qty) && line.qty >= 0)
+      : [];
+
+    if (poMode) {
+      if (card.kind !== "blank") {
+        return res.status(400).json({ message: "PO mode is only available on blank cards" });
+      }
+
+      if (!poOrderNumber) {
+        return res.status(400).json({ message: "Enter the production order number on row 1" });
+      }
+
+      if (!poLines.length) {
+        return res.status(400).json({ message: "Load the BOM and enter at least one valid actual quantity" });
+      }
+    }
+
     const existing = await getLines(code);
     const incoming = new Map();
 
@@ -1912,60 +2094,72 @@ app.post(
     let counted = 0;
     let voided = 0;
 
-    for (const line of existing) {
+    for (const [lineIndex, line] of existing.entries()) {
       const input = incoming.get(line.id);
       const blankCard = card.kind === "blank";
 
-      const material = blankCard
+      let material = blankCard
         ? clean(input.material)
         : line.material;
 
-      const description = blankCard
+      let description = blankCard
         ? clean(input.description)
         : line.description;
 
-      const bin = blankCard
+      let bin = blankCard
         ? clean(input.bin)
         : line.bin;
 
-
-      const isVoid =
+      let isVoid =
         blankCard &&
         !material &&
         !description &&
         !bin &&
         (input.qty === null || input.qty === "");
 
-      if (
-        material.length > 120 ||
-        description.length > 500 ||
-        bin.length > 120
-      ) {
-        return res.status(400).json({
-          message: `Text too long on row ${line.line_no}`
-        });
-      }
+      let qty = isVoid ? null : input.qty;
 
-      if (blankCard && !isVoid && !material) {
-        return res.status(400).json({
-          message:
-            `Enter a material number on row ${line.line_no}`
-        });
-      }
+      if (poMode) {
+        if (lineIndex === 0) {
+          material = poOrderNumber;
+          description = "Production Order";
+          bin = "";
+          isVoid = false;
+          qty = 0;
+        } else {
+          isVoid = true;
+          qty = null;
+        }
+      } else {
+        if (
+          material.length > 120 ||
+          description.length > 500 ||
+          bin.length > 120
+        ) {
+          return res.status(400).json({
+            message: `Text too long on row ${line.line_no}`
+          });
+        }
 
-      const qty = isVoid ? null : input.qty;
+        if (blankCard && !isVoid && !material) {
+          return res.status(400).json({
+            message:
+              `Enter a material number on row ${line.line_no}`
+          });
+        }
 
-      if (
-        !isVoid &&
-        (
-          !Number.isSafeInteger(qty) ||
-          qty < 0
-        )
-      ) {
-        return res.status(400).json({
-          message:
-            `Enter a valid physical count on row ${line.line_no}`
-        });
+        if (
+          !isVoid &&
+          (
+            !Number.isSafeInteger(qty) ||
+            qty < 0
+          )
+        ) {
+          return res.status(400).json({
+            message:
+              `Enter a valid physical count on row ${line.line_no}`
+          });
+        }
       }
 
       if (isVoid) {
@@ -1989,6 +2183,37 @@ app.post(
         message:
           "A PIP card needs at least one counted material"
       });
+    }
+
+    if (card.kind === "blank" && !poMode) {
+      const pool = await getSqlPool();
+      const partCache = new Map();
+
+      for (const update of updates) {
+        if (update.isVoid) continue;
+
+        const materialKey = update.material.toUpperCase();
+        if (!partCache.has(materialKey)) {
+          const partResult = await pool.request()
+            .input("material", sql.NVarChar, update.material)
+            .query(`
+              SELECT TOP 1 Material, MaterialDescription
+              FROM INV.PartUniverse
+              WHERE Material = @material
+            `);
+          partCache.set(materialKey, partResult.recordset[0] || null);
+        }
+
+        const part = partCache.get(materialKey);
+        if (!part) {
+          return res.status(400).json({
+            message: `Material ${update.material} was not found in INV.PartUniverse`
+          });
+        }
+
+        update.material = clean(part.Material);
+        update.description = clean(part.MaterialDescription) || update.description;
+      }
     }
 
     const freshCard = await getCard(code);
@@ -2029,10 +2254,10 @@ app.post(
 
         return {
           line_no: line.line_no,
-          material: line.material,
-          description: line.description,
-          bin: line.bin,
-          is_void: Number(line.is_void) === 1,
+          material: match ? match.material : line.material,
+          description: match ? match.description : line.description,
+          bin: match ? match.bin : line.bin,
+          is_void: match ? Number(match.isVoid) === 1 : Number(line.is_void) === 1,
           qty,
           physical_qty: qty
         };
@@ -2044,7 +2269,9 @@ app.post(
         subArea: card.area,
         userName: req.session.user?.username,
         lines: finalLines,
-        pipStatus: "confirmed"
+        pipStatus: "confirmed",
+        poOrder: poOrderNumber,
+        poLines
       });
     } catch (syncError) {
       console.error("Inventory sync failed on card submit:", syncError.message);
