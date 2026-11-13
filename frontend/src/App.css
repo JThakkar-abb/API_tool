@@ -1162,3 +1162,247 @@
     letter-spacing: 1.5px;
   }
 }
+
+
+
+.count-space,
+.leader-count-space {
+  background: #ffffff;
+  min-width: 80px;
+}
+
+/* Keep count columns clear for handwriting */
+
+.pip-sheet-table th:nth-child(5),
+.pip-sheet-table th:nth-child(6) {
+  text-align: center;
+}
+
+@media print {
+  .print-only .count-space,
+  .print-only .leader-count-space {
+    background: white !important;
+  }
+}
+
+
+/* ========================================
+   FINANCE AUDIT CONTROL
+======================================== */
+
+.finance-nav-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+}
+
+/* Finance Login Screen */
+
+.finance-login-panel {
+  max-width: 520px;
+  width: 100%;
+  margin: 40px auto;
+  padding: 40px;
+  text-align: left;
+}
+
+.finance-lock-icon {
+  font-size: 42px;
+  margin-bottom: 20px;
+}
+
+.finance-login-panel h2 {
+  font-size: 24px;
+  margin-bottom: 12px;
+  color: #232323;
+}
+
+.finance-login-panel .muted {
+  color: #667085;
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.finance-login-panel form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 25px;
+}
+
+.finance-login-panel label {
+  font-weight: 600;
+  color: #333;
+}
+
+.finance-login-panel input {
+  width: 100%;
+  padding: 14px;
+  font-size: 15px;
+  border: 1px solid #cbd0d8;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+
+.finance-login-panel input:focus {
+  outline: none;
+  border-color: #e00000;
+}
+
+.finance-login-panel button {
+  min-height: 46px;
+  width: 100%;
+}
+
+/* Finance Workspace */
+
+.finance-workspace {
+  padding: 30px;
+}
+
+.finance-workspace-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.finance-workspace-header h2 {
+  margin-bottom: 8px;
+}
+
+.finance-placeholder {
+  margin-top: 30px;
+  padding: 30px;
+  border: 1px solid #e1e5eb;
+  border-radius: 8px;
+  background: #f8f9fb;
+}
+
+.finance-placeholder h3 {
+  margin-top: 0;
+  color: #333;
+}
+
+.finance-placeholder p {
+  color: #667085;
+  line-height: 1.6;
+}
+
+@media (max-width: 600px) {
+  .finance-login-panel {
+    padding: 22px;
+    margin: 20px auto;
+  }
+
+  .finance-workspace {
+    padding: 20px;
+  }
+}
+.finance-monitoring {
+  margin-top: 25px;
+}
+
+.finance-monitoring h3 {
+  margin: 20px 0;
+  color: #252525;
+}
+
+.finance-monitoring .overview-kpis {
+  margin: 25px 0;
+}
+
+.finance-monitoring .overview-table {
+  width: 100%;
+}
+
+
+/* =====================================
+   FINANCE SAP INVENTORY UPLOAD
+===================================== */
+
+.finance-sap-upload {
+  padding: 24px;
+  margin-bottom: 30px;
+  background: #f8f9fb;
+  border: 1px solid #e1e5eb;
+  border-radius: 10px;
+}
+
+.finance-sap-heading {
+  margin-bottom: 22px;
+}
+
+.finance-sap-heading h3 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.finance-sap-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.finance-sap-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.finance-sap-field label {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.finance-sap-field input,
+.finance-sap-field select {
+  min-height: 44px;
+  padding: 10px;
+  border: 1px solid #cbd0d8;
+  border-radius: 6px;
+  background: #fff;
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.finance-sap-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.finance-sap-form button {
+  align-self: flex-start;
+  min-height: 44px;
+}
+
+.finance-upload-history {
+  margin-top: 35px;
+}
+
+.finance-history-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 15px;
+  flex-wrap: wrap;
+  margin-bottom: 15px;
+}
+
+.finance-history-title h3 {
+  margin: 0;
+}
+
+@media (max-width: 700px) {
+  .finance-sap-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .finance-sap-upload {
+    padding: 16px;
+  }
+}
