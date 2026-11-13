@@ -84,13 +84,19 @@ function ensureColumn(table, column, declaration) {
   }
 }
 
+
 ensureColumn("batches", "area_id", "INTEGER");
 ensureColumn("cards", "submitted_at", "TEXT");
+ensureColumn("lines", "leader_qty", "REAL");
 ensureColumn(
   "lines",
   "is_void",
   "INTEGER NOT NULL DEFAULT 0"
 );
+
+// =====================================
+// EXISTING PIP DATABASE INDEXES
+// =====================================
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS
@@ -98,6 +104,42 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS
   idx_lines_card ON lines(card_id);
+`);
+
+// =====================================
+// FINANCE SAP INVENTORY DATABASE
+// =====================================
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS finance_uploads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL,
+    uploaded_by TEXT NOT NULL,
+    uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    snapshot_date TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+  );
+
+  CREATE TABLE IF NOT EXISTS finance_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    upload_id INTEGER NOT NULL,
+    material TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    sloc TEXT NOT NULL,
+    sap_qty REAL NOT NULL,
+    sap_value REAL,
+    currency TEXT,
+    FOREIGN KEY(upload_id)
+      REFERENCES finance_uploads(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS
+  idx_finance_inventory_upload
+  ON finance_inventory(upload_id);
+
+  CREATE INDEX IF NOT EXISTS
+  idx_finance_inventory_material
+  ON finance_inventory(material, sloc);
 `);
 
 
@@ -114,6 +156,7 @@ app.use(session({
     secure: false
   }
 }));
+
 
 const users = [
   {
@@ -133,6 +176,38 @@ const users = [
     )
   }
 ];
+
+/* =====================================
+   FINANCE ACCESS CONFIGURATION
+===================================== */
+
+if (!process.env.FINANCE_PASSWORD) {
+  throw new Error(
+    "FINANCE_PASSWORD is missing from backend/.env"
+  );
+}
+
+const financePasswordHash = bcrypt.hashSync(
+  process.env.FINANCE_PASSWORD,
+  10
+);
+
+// Finance access requires:
+// 1. An authenticated Manager session
+// 2. A successful Finance password check
+
+function requireFinance(req, res, next) {
+  if (
+    req.session.user?.role !== "manager" ||
+    req.session.financeUnlocked !== true
+  ) {
+    return res.status(403).json({
+      message: "Finance authorization required"
+    });
+  }
+
+  next();
+}
 
 function requireLogin(req, res, next) {
   if (!req.session.user) {
@@ -938,6 +1013,7 @@ app.post(
       }
 
       const qty = isVoid ? null : input.qty;
+      const leaderQty = isVoid ? null : input.leaderQty;
 
       if (
         !isVoid &&
@@ -1086,6 +1162,495 @@ app.get(
     res.json(result);
   }
 );
+
+
+/* =====================================
+   FINANCE AUDIT CONTROL API
+===================================== */
+
+// 1. Check Finance access
+app.get(
+  "/api/finance/status",
+  requireManager,
+  (req, res) => {
+    res.json({
+      unlocked: req.session.financeUnlocked === true
+    });
+  }
+);
+
+// 2. Verify Finance password
+app.post(
+  "/api/finance/unlock",
+  requireManager,
+  (req, res) => {
+    const password = req.body?.password;
+
+    if (
+      typeof password !== "string" ||
+      password.length === 0 ||
+      password.length > 256
+    ) {
+      return res.status(400).json({
+        message: "Enter a valid Finance password"
+      });
+    }
+
+    const valid = bcrypt.compareSync(
+      password,
+      financePasswordHash
+    );
+
+    if (!valid) {
+      return res.status(401).json({
+        message: "Incorrect Finance password"
+      });
+    }
+
+    req.session.financeUnlocked = true;
+
+    req.session.save(error => {
+      if (error) {
+        return res.status(500).json({
+          message: "Unable to save Finance session"
+        });
+      }
+
+      res.json({
+        unlocked: true
+      });
+    });
+  }
+);
+
+// 3. Lock Finance tab
+app.post(
+  "/api/finance/lock",
+  requireManager,
+  (req, res) => {
+    req.session.financeUnlocked = false;
+
+    req.session.save(error => {
+      if (error) {
+        return res.status(500).json({
+          message: "Unable to lock Finance session"
+        });
+      }
+
+      res.json({
+        unlocked: false
+      });
+    });
+  }
+);
+
+
+/* =========================================
+   FINANCE SAP INVENTORY EXCEL UPLOAD
+========================================= */
+
+app.post(
+  "/api/finance/upload-inventory",
+
+  // Only authorized Finance sessions
+  requireFinance,
+
+  // Accept Excel file bytes
+  express.raw({
+    type: "application/octet-stream",
+    limit: "15mb"
+  }),
+
+  async (req, res) => {
+    try {
+      // -----------------------------
+      // 1. Validate upload information
+      // -----------------------------
+
+      const filename = path.basename(
+        clean(req.headers["x-filename"] || "inventory.xlsx")
+      );
+
+      const snapshotDate = clean(
+        req.headers["x-snapshot-date"]
+      );
+
+      const currency = clean(
+        req.headers["x-currency"]
+      ).toUpperCase();
+
+      if (!/^[A-Z]{3}$/.test(currency)) {
+        return res.status(400).json({
+          message:
+            "Specify a valid three-letter currency, " +
+            "for example USD."
+        });
+      }
+
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate) ||
+        Number.isNaN(
+          Date.parse(snapshotDate + "T00:00:00Z")
+        ) ||
+        new Date(snapshotDate + "T00:00:00Z")
+          .toISOString()
+          .slice(0, 10) !== snapshotDate
+      ) {
+        return res.status(400).json({
+          message:
+            "Enter a valid SAP inventory cutoff date " +
+            "in YYYY-MM-DD format."
+        });
+      }
+
+      if (
+        !Buffer.isBuffer(req.body) ||
+        req.body.length === 0
+      ) {
+        return res.status(400).json({
+          message: "Select an Excel file."
+        });
+      }
+
+      // -----------------------------
+      // 2. Read Excel workbook
+      // -----------------------------
+
+      const workbook = new ExcelJS.Workbook();
+
+      await workbook.xlsx.load(req.body);
+
+      const sheet = workbook.worksheets[0];
+
+      if (!sheet) {
+        return res.status(400).json({
+          message: "Excel worksheet not found."
+        });
+      }
+
+      // -----------------------------
+      // 3. Detect Excel column headers
+      // -----------------------------
+
+      let headers = {};
+      let headerRow = 0;
+
+      for (
+        let rowNumber = 1;
+        rowNumber <= Math.min(sheet.rowCount, 25);
+        rowNumber++
+      ) {
+        const found = {};
+
+        sheet.getRow(rowNumber).eachCell(
+          (cell, columnNumber) => {
+            const key = normalize(readCell(cell));
+
+            if (key) {
+              found[key] = columnNumber;
+            }
+          }
+        );
+
+        if (
+          (found.material || found.materialnumber) &&
+          (
+            found.storagelocation ||
+            found.sloc ||
+            found.storageloc
+          ) &&
+          (
+            found.unrestricted ||
+            found.unrestrictedstock
+          ) &&
+          (
+            found.valueunrestricted ||
+            found.unrestrictedvalue
+          )
+        ) {
+          headers = found;
+          headerRow = rowNumber;
+          break;
+        }
+      }
+
+      if (!headerRow) {
+        return res.status(400).json({
+          message:
+            "Unable to identify the required columns. " +
+            "Expected Material, Storage Location, " +
+            "Unrestricted, and Value Unrestricted."
+        });
+      }
+
+      function findFinanceColumn(...names) {
+        for (const name of names) {
+          const column = headers[normalize(name)];
+
+          if (column) return column;
+        }
+
+        return 0;
+      }
+
+      const columns = {
+        material: findFinanceColumn(
+          "Material",
+          "Material Number"
+        ),
+
+        description: findFinanceColumn(
+          "Material Description",
+          "Description"
+        ),
+
+        sloc: findFinanceColumn(
+          "Storage Location",
+          "SLoc",
+          "Storage Loc"
+        ),
+
+        qty: findFinanceColumn(
+          "Unrestricted",
+          "Unrestricted Stock"
+        ),
+
+        value: findFinanceColumn(
+          "Value Unrestricted",
+          "Unrestricted Value"
+        )
+      };
+
+      // -----------------------------
+      // 4. Read inventory rows
+      // -----------------------------
+
+      const inventory = [];
+
+      function parseFinanceNumber(value) {
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? value : NaN;
+        }
+
+        const original = clean(value);
+
+        if (!original) return NaN;
+
+        const negative =
+          original.startsWith("(") &&
+          original.endsWith(")");
+
+        const normalized = original
+          .replace(/,/g, "")
+          .replace(/^\(/, "")
+          .replace(/\)$/, "")
+          .trim();
+
+        if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(normalized)) {
+          return NaN;
+        }
+
+        const parsed = Number(normalized);
+
+        return negative ? -parsed : parsed;
+      }
+
+      for (
+        let rowNumber = headerRow + 1;
+        rowNumber <= sheet.rowCount;
+        rowNumber++
+      ) {
+        const row = sheet.getRow(rowNumber);
+
+        const material = clean(
+          getColumn(row, columns.material)
+        );
+
+        const sloc = clean(
+          getColumn(row, columns.sloc)
+        );
+
+        // Ignore empty rows and subtotal rows
+        // without a material number.
+        if (!material) continue;
+
+        if (!sloc) {
+          throw new Error(
+            `Storage Location missing on row ${rowNumber}`
+          );
+        }
+
+        const sapQty = parseFinanceNumber(
+          getColumn(row, columns.qty)
+        );
+
+        const sapValue = parseFinanceNumber(
+          getColumn(row, columns.value)
+        );
+
+        if (!Number.isFinite(sapQty)) {
+          throw new Error(
+            `Invalid SAP quantity on row ${rowNumber}`
+          );
+        }
+
+        if (!Number.isFinite(sapValue)) {
+          throw new Error(
+            `Invalid SAP inventory value on row ${rowNumber}`
+          );
+        }
+
+        inventory.push({
+          material,
+          description: clean(
+            getColumn(row, columns.description)
+          ),
+          sloc,
+          sap_qty: sapQty,
+          sap_value: sapValue,
+          currency
+        });
+      }
+
+      if (inventory.length === 0) {
+        return res.status(400).json({
+          message:
+            "No valid inventory materials found."
+        });
+      }
+
+      // -----------------------------
+      // 5. Save Finance upload
+      // -----------------------------
+
+      let uploadId;
+
+      db.exec("BEGIN");
+
+      try {
+        const result = db.prepare(`
+          INSERT INTO finance_uploads (
+            filename,
+            uploaded_by,
+            snapshot_date,
+            status
+          )
+          VALUES (?, ?, ?, 'imported')
+        `).run(
+          filename,
+          req.session.user.username,
+          snapshotDate
+        );
+
+        uploadId = Number(result.lastInsertRowid);
+
+        const insertInventory = db.prepare(`
+          INSERT INTO finance_inventory (
+            upload_id,
+            material,
+            description,
+            sloc,
+            sap_qty,
+            sap_value,
+            currency
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        for (const item of inventory) {
+          insertInventory.run(
+            uploadId,
+            item.material,
+            item.description,
+            item.sloc,
+            item.sap_qty,
+            item.sap_value,
+            item.currency
+          );
+        }
+
+        db.exec("COMMIT");
+
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+
+      // -----------------------------
+      // 6. Return upload summary
+      // -----------------------------
+
+      const totalValue = inventory.reduce(
+        (sum, item) => sum + item.sap_value,
+        0
+      );
+
+      res.json({
+        success: true,
+        uploadId,
+        filename,
+        snapshotDate,
+        currency,
+        materials: inventory.length,
+        totalValue
+      });
+
+    } catch (error) {
+      console.error(
+        "Finance upload error:",
+        error.message
+      );
+
+      res.status(400).json({
+        message: error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================
+   FINANCE UPLOAD HISTORY
+========================================= */
+
+app.get(
+  "/api/finance/uploads",
+  requireFinance,
+  (req, res) => {
+    const uploads = db.prepare(`
+      SELECT
+        u.id,
+        u.filename,
+        u.uploaded_by,
+        u.uploaded_at,
+        u.snapshot_date,
+        u.status,
+        COUNT(i.id) AS materials,
+        SUM(i.sap_value) AS total_value,
+        MIN(i.currency) AS currency
+      FROM finance_uploads u
+      LEFT JOIN finance_inventory i
+        ON i.upload_id = u.id
+      GROUP BY u.id
+      ORDER BY u.id DESC
+    `).all();
+
+    res.json(uploads);
+  }
+);
+
+
+// 4. Protected Finance workspace
+app.get(
+  "/api/finance/workspace",
+  requireFinance,
+  (req, res) => {
+    res.json({
+      message: "Finance workspace authorized"
+    });
+  }
+);
+
 
 app.listen(PORT, () => {
   console.log(
