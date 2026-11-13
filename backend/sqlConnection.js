@@ -1,6 +1,7 @@
 
+const path = require("node:path");
 const sql = require("mssql");
-require("dotenv").config();
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const config = {
   server: process.env.SQL_SERVER,
@@ -26,6 +27,19 @@ const config = {
 let poolPromise = null;
 
 function getSqlPool() {
+  const missing = [
+    "SQL_SERVER",
+    "SQL_DATABASE",
+    "SQL_USER",
+    "SQL_PASSWORD"
+  ].filter(key => !process.env[key]);
+
+  if (missing.length) {
+    throw new Error(
+      `Missing SQL configuration: ${missing.join(", ")}`
+    );
+  }
+
   if (!poolPromise) {
     poolPromise = new sql.ConnectionPool(config)
       .connect()
@@ -38,4 +52,5 @@ function getSqlPool() {
   return poolPromise;
 }
 
-module.exports = { getSqlPool };
+module.exports = { config, getSqlPool };
+module.exports.default = config;

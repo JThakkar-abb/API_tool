@@ -12,7 +12,8 @@
   "dependencies": {
     "jsbarcode": "^3.12.3",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.5"
   },
   "devDependencies": {
     "@types/jsbarcode": "^3.11.4",

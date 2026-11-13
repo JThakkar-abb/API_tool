@@ -1,6 +1,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { Navigate, Route, Routes } from "react-router-dom";
 import JsBarcode from "jsbarcode";
 import "./App.css";
 
@@ -39,6 +40,8 @@ type MaterialLine = {
   physical_qty: number | null;
   leader_qty?: number | null;
   sap_qty?: number | null;
+  status?: string | null;
+  recount?: number | boolean | null;
   is_void: number;
 };
 
@@ -48,7 +51,11 @@ type PipCard = {
   kind: "filled" | "blank";
   sloc: string;
   area: string;
-  submitted_at: string | null;
+  area_id?: number | null;
+  leaders?: { role: string; name: string }[];
+  is_recount?: boolean;
+  status?: string | null;
+  submitted_at?: string | null;
   lines: MaterialLine[];
 };
 
@@ -204,6 +211,11 @@ function PipCardSheet({
 }) {
   const isBlank = card.kind === "blank";
   const isSubmitted = !!card.submitted_at;
+  const isRecountPending =
+    String(card.status || "").trim().toLowerCase() === "rc pending";
+  const rows = card.is_recount
+    ? card.lines
+    : Array.from({ length: 10 }, (_, index) => card.lines[index] ?? null);
 
   return (
     <article className="pip-sheet">
@@ -243,7 +255,21 @@ function PipCardSheet({
 
         <div>
           <strong>Card Status:</strong>{" "}
-          {isSubmitted ? "SUBMITTED" : "PENDING"}
+          {isRecountPending
+            ? "RECOUNT PENDING"
+            : isSubmitted
+              ? "SUBMITTED"
+              : "PENDING"}
+          {!!card.leaders?.length && (
+            <div className="pip-sheet-status-leaders">
+              {card.leaders.map(leader => (
+                <div key={leader.role}>
+                  <strong>{leader.role}:</strong>{" "}
+                  {leader.name}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div>
@@ -273,11 +299,7 @@ function PipCardSheet({
         </thead>
 
         <tbody>
-          {Array.from(
-            { length: 10 },
-            (_, index) => {
-              const line = card.lines[index];
-
+          {rows.map((line, index) => {
               const voidRow =
                 isBlank &&
                 isSubmitted &&
@@ -311,8 +333,7 @@ function PipCardSheet({
                   <td className="leader-count-space"></td>
                 </tr>
               );
-            }
-          )}
+          })}
         </tbody>
       </table>
 
@@ -973,6 +994,7 @@ function FinanceMonitoring({
                     <th>Pending</th>
                     <th>Completion</th>
                     <th>Recount Eligibility</th>
+                    <th>Request Recount</th>
                   </tr>
                 </thead>
 
@@ -1030,13 +1052,22 @@ function FinanceMonitoring({
                               : "Locked"}
                           </span>
                         </td>
+                        <td>
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={!eligible}
+                          >
+                            Request Recount
+                          </button>
+                        </td>
                       </tr>
                     );
                   })}
 
                   {overview.byPsa.length === 0 && (
                     <tr>
-                      <td colSpan={6}>
+                      <td colSpan={7}>
                         No PIP cards generated yet.
                       </td>
                     </tr>
@@ -1187,6 +1218,33 @@ function App() {
   const [printCards, setPrintCards] =
     useState<PipCard[]>([]);
 
+  const [recountOpen, setrecountOpen] =
+    useState(false);
+
+  const [recountList, setrecountList] = useState<
+    { code: string; area: string; status: string }[]
+  >([]);
+
+  const [recountCode, setrecountCode] =
+    useState("");
+
+  const [recountCard, setrecountCard] =
+    useState<PipCard | null>(null);
+
+  const [recountTicketNumbers, setrecountTicketNumbers] =
+    useState<number[]>([]);
+
+  const [poChecked, setPoChecked] = useState(false);
+
+  const [poLines, setPoLines] = useState<
+    {
+      material: string;
+      description: string;
+      printedQty: number;
+      qty: string;
+    }[]
+  >([]);
+
   const [blankQuantity, setBlankQuantity] =
     useState(1);
 
@@ -1242,19 +1300,33 @@ function App() {
     void loadBatches();
     void loadOverview();
 
-    setAreasLoading(true);
+    const loadProductionAreas = async () => {
+      setAreasLoading(true);
+      setError("");
 
-    api("/production-areas")
-      .then((data: ProductionArea[]) => {
+      try {
+        const data: ProductionArea[] = await api(
+          `/production-areas?location=${encodeURIComponent(sloc)}`
+        );
+
         setProductionAreas(data);
-      })
-      .catch(err => {
-        setError(err.message);
-      })
-      .finally(() => {
+        setSelectedAreaId(previous => {
+          if (previous && data.some(area => String(area.id) === previous)) {
+            return previous;
+          }
+
+          return "";
+        });
+      } catch (err) {
+        setError((err as Error).message);
+        setProductionAreas([]);
+      } finally {
         setAreasLoading(false);
-      });
-  }, [user]);
+      }
+    };
+
+    loadProductionAreas();
+  }, [user, sloc]);
 
   async function loadBatches() {
     try {
@@ -1701,9 +1773,50 @@ function App() {
     }
   }
 
-  // ===================================================
-  // MANAGER: FETCH CARDS
-  // ===================================================
+  async function generateCardsFromArea() {
+    if (!selectedAreaId) {
+      setError("Select a Production Supply Area.");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const result = await api("/area-cards", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          areaId: Number(selectedAreaId),
+          location: sloc
+        })
+      });
+
+      setBatchId(result.batchId);
+      setFile(null);
+      setCards([]);
+      setShowPreview(false);
+
+      await loadBatches();
+
+      setMessage(
+        `${result.materials} materials matched for ` +
+        `${result.area}. ` +
+        `${result.cards} PIP cards generated.`
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* ==================================
+     MANAGER: FETCH CARDS
+  ================================== */
 
   async function fetchCards(): Promise<PipCard[]> {
     if (!batchId) {
@@ -1743,13 +1856,6 @@ function App() {
   // ===================================================
 
   async function generateBlankCards() {
-    if (!batchId) {
-      setError(
-        "Select an audit batch."
-      );
-      return;
-    }
-
     if (
       !Number.isInteger(blankQuantity) ||
       blankQuantity < 1 ||
@@ -1766,27 +1872,33 @@ function App() {
     setMessage("");
 
     try {
-      const result =
-        await api("/blank-cards", {
-          method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
-          body: JSON.stringify({
-            batchId,
-            quantity: blankQuantity
-          })
-        });
+      const result = await api("/blank-cards", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          quantity: blankQuantity,
+          location: sloc,
+          areaId: selectedAreaId ? Number(selectedAreaId) : null
+        })
+      });
 
-      setCards(await fetchCards());
+      const updatedBatches: Batch[] = await api("/batches");
+      setBatches(updatedBatches);
+      setBatchId(result.batchId);
+
+      const updated: PipCard[] = await api(
+        `/batches/${result.batchId}/cards`
+      );
+
+      setCards(updated);
       setShowPreview(true);
 
       await loadOverview();
 
       setMessage(
-        `${result.generated.length} ` +
-        `blank cards generated.`
+        `${result.generated.length} blank cards created for ${result.area}.`
       );
 
     } catch (err) {
@@ -1841,9 +1953,132 @@ function App() {
     }
   }
 
-  // ===================================================
-  // AUDITOR: FIND PIP CARD
-  // ===================================================
+  /* ==================================
+     MANAGER: recount PIP CARD
+  ================================== */
+
+  async function openrecountModal() {
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const list: {
+        code: string;
+        area: string;
+        status: string;
+      }[] = await api("/recount/cards");
+
+      if (!list.length) {
+        setError("No PIP cards found to recount.");
+        return;
+      }
+
+      const confirmedCards = list.filter(card =>
+        String(card.status || "").trim().toLowerCase() === "confirmed"
+      );
+
+      if (!confirmedCards.length) {
+        setError("No confirmed PIP cards are flagged for recount.");
+        return;
+      }
+
+      setrecountList(confirmedCards);
+      setrecountCode(confirmedCards[0].code);
+      setrecountCard(null);
+      setrecountTicketNumbers([]);
+      await loadrecountCard(confirmedCards[0].code);
+      setrecountOpen(true);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadrecountCard(code: string) {
+    const card: PipCard = await api(
+      `/recount/cards/${encodeURIComponent(code)}`
+    );
+
+    setrecountCard(card);
+    setrecountTicketNumbers(
+      card.lines
+        .filter(line => Number(line.recount) === 1)
+        .map(line => line.id)
+    );
+  }
+
+  async function selectrecountCard(code: string) {
+    setrecountCode(code);
+    setrecountCard(null);
+    setrecountTicketNumbers([]);
+    if (!code) return;
+
+    setBusy(true);
+    setError("");
+    try {
+      await loadrecountCard(code);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitrecount() {
+    if (!recountCode || !recountCard || !recountTicketNumbers.length) {
+      setError("Select at least one confirmed material to recount.");
+      return;
+    }
+
+    const cardForPrint = recountCard;
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const result = await api(
+        `/recount/cards/${encodeURIComponent(recountCode)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ticketNumbers: recountTicketNumbers })
+        }
+      );
+
+      const selectedTicketNumbers = new Set(recountTicketNumbers);
+      const recountPrintCard: PipCard = {
+        ...cardForPrint,
+        is_recount: true,
+        status: result.status,
+        lines: cardForPrint.lines
+          .filter(line => selectedTicketNumbers.has(line.id))
+          .map((line, index) => ({
+            ...line,
+            line_no: index + 1,
+            recount: 1,
+            status: result.status
+          }))
+      };
+
+      setrecountOpen(false);
+      setPrintCards([recountPrintCard]);
+
+      window.setTimeout(() => {
+        window.print();
+      }, 500);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* ==================================
+     AUDITOR: FIND PIP CARD
+  ================================== */
 
   async function findCard(event: FormEvent) {
     event.preventDefault();
@@ -1878,14 +2113,8 @@ function App() {
       }
 
       setEntries(values);
-
-      if (card.submitted_at) {
-        setMessage(
-          "This PIP card has already been submitted. " +
-          "It is now read-only."
-        );
-      }
-
+      setPoChecked(false);
+      setPoLines([]);
     } catch (err) {
       setSelectedCard(null);
       setError(
@@ -1910,131 +2139,215 @@ function App() {
     }));
   }
 
-  // ===================================================
-  // AUDITOR: SUBMIT COUNTS
-  // ===================================================
-
-  async function submitCounts() {
-    if (
-      !selectedCard ||
-      selectedCard.submitted_at
-    ) {
-      return;
-    }
-
-    const submitted =
-      selectedCard.lines.map(line => {
-        const entry = entries[line.id];
-
-        return {
-          id: line.id,
-          material: entry.material,
-          description: entry.description,
-          bin: entry.bin,
-          qty: entry.qty.trim() === ""
-            ? null
-            : Number(entry.qty)
-        };
-      });
-
-    let counted = 0;
-    let voided = 0;
-
-    for (const row of submitted) {
-      const isBlankCard =
-        selectedCard.kind === "blank";
-
-      const isVoid =
-        isBlankCard &&
-        !row.material.trim() &&
-        !row.description.trim() &&
-        !row.bin.trim() &&
-        row.qty === null;
-
-      if (isVoid) {
-        voided++;
-        continue;
-      }
-
-      if (
-        isBlankCard &&
-        !row.material.trim()
-      ) {
-        setError(
-          "Every used blank-card row needs " +
-          "a material number."
-        );
-        return;
-      }
-
-      if (
-        row.qty === null ||
-        !Number.isSafeInteger(row.qty) ||
-        row.qty < 0
-      ) {
-        setError(
-          "Every used material row needs a " +
-          "valid whole-number count. " +
-          "Zero is allowed."
-        );
-        return;
-      }
-
-      counted++;
-    }
-
-    if (counted === 0) {
-      setError(
-        "Enter at least one material."
-      );
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `Submit ${selectedCard.code}?\n\n` +
-      `${counted} counted material rows\n` +
-      `${voided} VOID rows\n\n` +
-      "This submission will be final."
+  function updatePoQty(index: number, value: string) {
+    setPoLines(previous =>
+      previous.map((line, i) =>
+        i === index ? { ...line, qty: value } : line
+      )
     );
+  }
 
-    if (!confirmed) return;
+  /* ==================================
+     AUDITOR: LOAD PRODUCTION ORDER BOM
+  ================================== */
+
+  async function loadBom() {
+    if (!selectedCard) return;
+
+    const firstLine = selectedCard.lines[0];
+    const orderNumber = firstLine
+      ? (entries[firstLine.id]?.material || "").trim()
+      : "";
+
+    if (!orderNumber) {
+      setError("Enter the production order number in row 1.");
+      return;
+    }
 
     setBusy(true);
     setError("");
     setMessage("");
 
     try {
-      const result =
-        await api(
-          `/cards/${encodeURIComponent(
-            selectedCard.code
-          )}/counts`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type":
-                "application/json"
-            },
-            body: JSON.stringify({
-              lines: submitted
-            })
-          }
-        );
-
-      setMessage(
-        `PIP ${result.code} submitted successfully. ` +
-        `${result.counted} counted rows; ` +
-        `${result.voided} VOID rows.`
+      const rows: {
+        material: string;
+        description: string;
+        requirementQty: number;
+        storageLocation: string;
+        uom: string;
+      }[] = await api(
+        `/po/${encodeURIComponent(orderNumber)}`
       );
 
+      setPoLines(
+        rows.map(row => ({
+          material: row.material,
+          description: row.description,
+          printedQty: Number(row.requirementQty ?? 0),
+          qty: ""
+        }))
+      );
+
+      setMessage(
+        `Loaded ${rows.length} materials for order ${orderNumber}. ` +
+        "Verify the actual quantities."
+      );
+    } catch (err) {
+      const text = (err as Error).message;
+      setPoLines([]);
+
+      if (text.toLowerCase().includes("no order found")) {
+        window.alert(text);
+      } else {
+        setError(text);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* ==================================
+     AUDITOR: SAVE PHYSICAL COUNTS
+  ================================== */
+
+  async function saveCounts() {
+    if (!selectedCard || (selectedCard.submitted_at && !selectedCard.is_recount)) return;
+
+    const firstLine = selectedCard.lines[0];
+    const poOrderNumber = poChecked && firstLine
+      ? (entries[firstLine.id]?.material || "").trim()
+      : "";
+
+    const submitted = selectedCard.lines.map(line => {
+      const entry = entries[line.id];
+      return {
+        id: line.id,
+        material: entry.material,
+        description: entry.description,
+        bin: entry.bin,
+        qty: entry.qty.trim() === "" ? null : Number(entry.qty)
+      };
+    });
+
+    const recountRows = selectedCard.lines.filter(line =>
+      Number(line.recount) === 1 &&
+      String(line.status || "").trim().toLowerCase() === "rc pending"
+    );
+    const recountIds = new Set(recountRows.map(line => line.id));
+
+    const countedPo = poLines.filter(line => line.qty.trim() !== "");
+    if (selectedCard.is_recount) {
+      if (!recountRows.length) {
+        setError("This PIP card has no materials pending recount.");
+        return;
+      }
+
+      const invalid = submitted.some(item => {
+        if (!recountIds.has(item.id)) return false;
+        return item.qty === null || !Number.isSafeInteger(item.qty) || item.qty < 0;
+      });
+
+      if (invalid) {
+        setError("Enter a valid whole-number count for each selected recount material.");
+        return;
+      }
+    } else if (poChecked) {
+      if (!poOrderNumber) {
+        setError("Enter the production order number in row 1.");
+        return;
+      }
+
+      if (!countedPo.length) {
+        setError("Load the BOM and enter at least one actual quantity.");
+        return;
+      }
+
+      if (countedPo.some(line => {
+        const value = Number(line.qty);
+        return !Number.isSafeInteger(value) || value < 0;
+      })) {
+        setError("Enter valid whole-number actual quantities for the BOM materials.");
+        return;
+      }
+    } else {
+      const invalid = submitted.some(item => {
+        const emptyBlankRow = selectedCard.kind === "blank" &&
+          !item.material.trim() &&
+          !item.description.trim() &&
+          !item.bin.trim() &&
+          item.qty === null;
+
+        if (emptyBlankRow) return false;
+        if (selectedCard.kind === "blank" && !item.material.trim()) return true;
+        return item.qty === null || !Number.isSafeInteger(item.qty) || item.qty < 0;
+      });
+
+      if (invalid) {
+        setError("Enter a valid whole-number count for each material. Use 0 when the physical count is zero.");
+        return;
+      }
+    }
+
+    const voided = !selectedCard.is_recount && !poChecked && selectedCard.kind === "blank"
+      ? submitted.filter(item => !item.material.trim() && !item.description.trim() && !item.bin.trim() && item.qty === null).length
+      : 0;
+    const counted = selectedCard.is_recount
+      ? recountRows.length
+      : poChecked
+        ? countedPo.length
+        : submitted.length - voided;
+
+    if (!counted) {
+      setError("Enter at least one material.");
+      return;
+    }
+
+    if (!window.confirm(
+      `${selectedCard.is_recount ? "Submit recount for" : "Submit"} ${selectedCard.code}?\n\n` +
+      `${counted} counted material rows\n` +
+      `${voided} VOID rows\n\n` +
+      (selectedCard.is_recount
+        ? "Only selected recount rows will be updated."
+        : "This submission will be final.")
+    )) return;
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const result = await api(
+        `/cards/${encodeURIComponent(selectedCard.code)}/counts`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            lines: submitted,
+            ...(poChecked ? {
+              po: {
+                orderNumber: poOrderNumber,
+                lines: countedPo.map(line => ({
+                  material: line.material,
+                  qty: Number(line.qty),
+                  printedQty: line.printedQty
+                }))
+              }
+            } : {})
+          })
+        }
+      );
+
+      setMessage(
+        `PIP ${result.code} ${selectedCard.is_recount ? "recount" : "submitted"} successfully. ` +
+        `${result.counted} counted rows; ${result.voided} VOID rows.`
+      );
       setSelectedCard(null);
       setCardSearch("");
       setEntries({});
-
+      setPoChecked(false);
+      setPoLines([]);
     } catch (err) {
-      setError(
-        (err as Error).message
-      );
+      setError((err as Error).message);
     } finally {
       setBusy(false);
     }
@@ -2058,79 +2371,137 @@ function App() {
 
   if (!user) {
     return (
-      <main className="login-screen">
-        <form
-          className="login-box"
-          onSubmit={login}
-        >
-          <img
-            src="/OIP.webp"
-            alt="ABB Logo"
-            className="login-logo"
-          />
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <main className="login-screen">
+              <form className="login-box" onSubmit={login}>
+                <img
+                  src="/OIP.webp"
+                  alt="ABB Logo"
+                  className="login-logo"
+                />
 
-          <h1>
-            Physical Inventory Audit
-          </h1>
+                <h1>Warehouse Inventory Audit</h1>
 
-          <p className="muted">
-            ABB Internal Inventory Management
-          </p>
+                <p className="muted">
+                  ABB Internal Inventory Management
+                </p>
 
-          <label>Username</label>
+                <label>Username</label>
 
-          <input
-            value={username}
-            onChange={event =>
-              setUsername(event.target.value)
-            }
-            autoComplete="username"
-            placeholder="Enter username"
-            required
-          />
+                <input
+                  value={username}
+                  onChange={event =>
+                    setUsername(event.target.value)
+                  }
+                  autoComplete="username"
+                  placeholder="Enter username"
+                  required
+                />
 
-          <label>Password</label>
+                <label>Password</label>
 
-          <input
-            type="password"
-            value={password}
-            onChange={event =>
-              setPassword(event.target.value)
-            }
-            autoComplete="current-password"
-            placeholder="Enter password"
-            required
-          />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={event =>
+                    setPassword(event.target.value)
+                  }
+                  autoComplete="current-password"
+                  placeholder="Enter password"
+                  required
+                />
 
-          {error && (
-            <p className="error">
-              {error}
-            </p>
-          )}
+                {error && (
+                  <p className="error">{error}</p>
+                )}
 
-          <button
-            type="submit"
-            className="primary"
-            disabled={busy}
-          >
-            {busy
-              ? "Signing in..."
-              : "Sign In"}
-          </button>
+                <button
+                  type="submit"
+                  className="primary"
+                  disabled={busy}
+                >
+                  {busy ? "Signing in..." : "Sign In"}
+                </button>
 
-          <small>
-            Authorized physical inventory personnel only
-          </small>
-        </form>
-      </main>
+                <small>
+                  Authorized warehouse personnel only
+                </small>
+              </form>
+            </main>
+          }
+        />
+
+        <Route
+          path="*"
+          element={<Navigate to="/login" replace />}
+        />
+      </Routes>
     );
   }
 
-  // ===================================================
-  // MAIN DASHBOARD
-  // ===================================================
+  const loginScreen = (
+    <main className="login-screen">
+      <form className="login-box" onSubmit={login}>
+        <img
+          src="/OIP.webp"
+          alt="ABB Logo"
+          className="login-logo"
+        />
 
-  return (
+        <h1>Warehouse Inventory Audit</h1>
+
+        <p className="muted">
+          ABB Internal Inventory Management
+        </p>
+
+        <label>Username</label>
+
+        <input
+          value={username}
+          onChange={event =>
+            setUsername(event.target.value)
+          }
+          autoComplete="username"
+          placeholder="Enter username"
+          required
+        />
+
+        <label>Password</label>
+
+        <input
+          type="password"
+          value={password}
+          onChange={event =>
+            setPassword(event.target.value)
+          }
+          autoComplete="current-password"
+          placeholder="Enter password"
+          required
+        />
+
+        {error && (
+          <p className="error">{error}</p>
+        )}
+
+        <button
+          type="submit"
+          className="primary"
+          disabled={busy}
+        >
+          {busy ? "Signing in..." : "Sign In"}
+        </button>
+
+        <small>
+          Authorized warehouse personnel only
+        </small>
+      </form>
+    </main>
+  );
+
+  const dashboardScreen = (
     <div className="app-shell">
 
       {/* =====================================
@@ -2233,13 +2604,8 @@ function App() {
           </div>
 
           <div className="user-information">
-            <strong>
-              {user.username}
-            </strong>
-
-            <span>
-              {user.role.toUpperCase()}
-            </span>
+            <strong>{user!.username}</strong>
+            <span>{user!.role.toUpperCase()}</span>
           </div>
         </header>
 
@@ -2553,6 +2919,14 @@ function App() {
                       Upload Excel & Generate
                       PIP Cards
                     </button>
+
+                    <button
+                      className="secondary"
+                      onClick={generateCardsFromArea}
+                      disabled={busy || !selectedAreaId}
+                    >
+                      Generate PIP Cards from PSA Data
+                    </button>
                   </div>
                 </section>
 
@@ -2596,6 +2970,11 @@ function App() {
                     ))}
                   </select>
 
+                  {selectedArea && (
+                    <p className="muted">
+                      Selected: {selectedArea.strName}
+                    </p>
+                  )}
                   <div className="button-row">
                     <button
                       className="primary"
@@ -2607,69 +2986,163 @@ function App() {
 
                     <button
                       className="secondary"
-                      onClick={() =>
-                        printPipCards("filled")
-                      }
+                      onClick={() => printPipCards("filled")}
                       disabled={busy || !batchId}
                     >
                       Print Filled Cards
+                    </button>
+
+                    <button
+                      className="secondary"
+                      onClick={openrecountModal}
+                      disabled={busy}
+                    >
+                      Recount PIP Card
                     </button>
                   </div>
                 </section>
 
                 <section className="panel">
-                  <h3>
-                    4. Additional Blank PIP Cards
-                  </h3>
+                  <h3>4. Additional Blank PIP Cards</h3>
 
                   <p className="muted">
-                    Unused rows will become VOID
-                    once the Auditor submits
-                    a blank card.
+                    Use blank cards for materials not listed in the uploaded Excel file.
                   </p>
 
                   <div className="blank-card-controls">
-                    <label>
-                      Number of Blank Cards
-                    </label>
-
+                    <label>Number of Blank Cards</label>
                     <input
                       type="number"
                       min="1"
                       max="100"
                       value={blankQuantity}
-                      onChange={event =>
-                        setBlankQuantity(
-                          Number(
-                            event.target.value
-                          )
-                        )
-                      }
+                      onChange={event => setBlankQuantity(Number(event.target.value))}
                     />
                   </div>
 
                   <div className="button-row">
                     <button
                       className="primary"
-                      onClick={
-                        generateBlankCards
-                      }
-                      disabled={busy || !batchId}
+                      onClick={generateBlankCards}
+                      disabled={busy}
                     >
                       Generate Blank Cards
                     </button>
 
                     <button
                       className="secondary"
-                      onClick={() =>
-                        printPipCards("blank")
-                      }
+                      onClick={() => printPipCards("blank")}
                       disabled={busy || !batchId}
                     >
                       Print Blank Cards
                     </button>
                   </div>
                 </section>
+
+              {/* recount MODAL */}
+
+              {recountOpen && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => setrecountOpen(false)}
+                >
+                  <div
+                    className="modal"
+                    onClick={event =>
+                      event.stopPropagation()
+                    }
+                  >
+                    <h3>recount PIP Card</h3>
+
+                    <p className="muted">
+                      Select a previously generated PIP
+                      card to regenerate and print it.
+                    </p>
+
+                    <label>PIP Card</label>
+
+                    <select
+                      value={recountCode}
+                      onChange={event =>
+                        void selectrecountCard(event.target.value)
+                      }
+                    >
+                      {recountList.map(card => (
+                        <option
+                          key={card.code}
+                          value={card.code}
+                        >
+                          {card.code}
+                          {" — "}
+                          {card.area}
+                          {" ("}
+                          {card.status}
+                          {")"}
+                        </option>
+                      ))}
+                    </select>
+
+                    {recountCard && (
+                      <div className="recount-material-list">
+                        <p className="muted">
+                          Select the confirmed materials to recount.
+                        </p>
+
+                        {recountCard.lines.map(line => {
+                          const checked = recountTicketNumbers.includes(line.id);
+
+                          return (
+                            <label
+                              className="recount-material-option"
+                              key={line.id}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                disabled={busy}
+                                onChange={event => {
+                                  setrecountTicketNumbers(previous =>
+                                    event.target.checked
+                                      ? [...previous, line.id]
+                                      : previous.filter(id => id !== line.id)
+                                  );
+                                }}
+                              />
+                              <span>
+                                {line.line_no}. {line.material}
+                                {line.description ? ` - ${line.description}` : ""}
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div className="button-row">
+                      <button
+                        className="primary"
+                        onClick={submitrecount}
+                        disabled={
+                          busy || !recountCard || !recountTicketNumbers.length
+                        }
+                      >
+                        Save Selection & Print
+                      </button>
+
+                      <button
+                        className="secondary"
+                        onClick={() =>
+                          setrecountOpen(false)
+                        }
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* PIP CARD PREVIEW */}
 
                 {showPreview && (
                   <section className="panel preview-panel">
@@ -2777,18 +3250,59 @@ function App() {
                       </p>
                     </div>
 
-                    <span
-                      className={
-                        selectedCard.submitted_at
-                          ? "status-chip status-submitted"
-                          : "status-chip status-pending"
-                      }
-                    >
-                      {selectedCard.submitted_at
-                        ? "Submitted"
-                        : "Pending"}
+                    <span className="card-type">
+                      {selectedCard.is_recount
+                        ? "Recount Pending"
+                        : selectedCard.submitted_at
+                          ? "Confirmed / Read Only"
+                          : selectedCard.kind === "blank"
+                            ? "Blank Card"
+                            : "Material Card"}
                     </span>
                   </div>
+
+                  {selectedCard.submitted_at && !selectedCard.is_recount && (
+                    <div className="success-message">
+                      This card has already been confirmed. The saved counts are shown below and are read-only.
+                    </div>
+                  )}
+
+                  {selectedCard.is_recount && (
+                    <div className="success-message">
+                      Only materials marked for recount can be edited. All other rows are read-only.
+                    </div>
+                  )}
+
+                  {selectedCard.kind === "blank" &&
+                    !selectedCard.submitted_at && (
+                      <div className="po-controls">
+                        <label className="po-toggle">
+                          <input
+                            type="checkbox"
+                            checked={poChecked}
+                            onChange={event => {
+                              setPoChecked(
+                                event.target.checked
+                              );
+                              if (!event.target.checked) {
+                                setPoLines([]);
+                              }
+                            }}
+                          />
+                          Production Order (PO)
+                        </label>
+
+                        {poChecked && (
+                          <button
+                            className="secondary"
+                            onClick={loadBom}
+                            disabled={busy}
+                          >
+                            Load BOM
+                          </button>
+                        )}
+                      </div>
+                    )}
 
                   <div className="table-scroll">
                     <table className="entry-table">
@@ -2813,157 +3327,162 @@ function App() {
                               return null;
                             }
 
-                            const isBlank =
-                              selectedCard.kind ===
-                              "blank";
+                          const isBlank =
+                            selectedCard.kind === "blank";
+                          const isReadOnly = Boolean(
+                            selectedCard.submitted_at && !selectedCard.is_recount
+                          );
+                          const isRecountLine =
+                            Number(line.recount) === 1 &&
+                            String(line.status || "").trim().toLowerCase() === "rc pending";
+                          const canEditLine = selectedCard.is_recount
+                            ? isRecountLine
+                            : !isReadOnly;
+                          const canEditQty = canEditLine;
+                          const isPoLocked =
+                            poChecked && line.line_no !== 1;
+                          const isPoOrderRow =
+                            poChecked && line.line_no === 1;
 
-                            const locked =
-                              !!selectedCard.submitted_at;
-
-                            if (
-                              line.is_void === 1
-                            ) {
-                              return (
-                                <tr
-                                  key={line.id}
-                                  className="pip-void-row"
-                                >
-                                  <td>
-                                    {line.line_no}
-                                  </td>
-
-                                  <td colSpan={5}>
-                                    VOID — UNUSED ROW
-                                  </td>
-                                </tr>
-                              );
-                            }
-
+                          if (line.is_void === 1) {
                             return (
-                              <tr key={line.id}>
-                                <td>
-                                  {line.line_no}
-                                </td>
+                              <tr
+                                key={line.id}
+                                className="pip-void-row"
+                              >
+                                <td>{line.line_no}</td>
+                                <td colSpan={5}>VOID</td>
+                              </tr>
+                            );
+                          }
 
-                                {(
-                                  [
-                                    "material",
-                                    "description"
-                                  ] as const
-                                ).map(field => (
-                                  <td key={field}>
-                                    {isBlank ? (
-                                      <input
-                                        value={
-                                          entry[field]
-                                        }
-                                        disabled={
-                                          locked
-                                        }
-                                        onChange={
-                                          event =>
-                                            updateEntry(
-                                              line.id,
-                                              field,
-                                              event.target.value
-                                            )
-                                        }
-                                        placeholder={
-                                          field
-                                        }
-                                      />
-                                    ) : (
-                                      entry[field] ||
-                                      "—"
-                                    )}
-                                  </td>
-                                ))}
+                          return (
+                            <tr key={line.id}>
+                              <td>{line.line_no}</td>
 
-                                <td>
-                                  {selectedCard.area}
-                                </td>
-
-                                <td>
-                                  {isBlank ? (
+                              {(["material", "description"] as const).map(field => (
+                                <td key={field}>
+                                  {isBlank && !selectedCard.is_recount && !isReadOnly ? (
                                     <input
-                                      value={
-                                        entry.bin
+                                      value={entry[field]}
+                                      onChange={event =>
+                                        updateEntry(line.id, field, event.target.value)
                                       }
-                                      disabled={
-                                        locked
+                                      placeholder={
+                                        isPoOrderRow && field === "material"
+                                          ? "Production Order #"
+                                          : field
                                       }
-                                      onChange={
-                                        event =>
-                                          updateEntry(
-                                            line.id,
-                                            "bin",
-                                            event.target.value
-                                          )
-                                      }
-                                      placeholder="Bin"
+                                      readOnly={isPoLocked}
+                                      disabled={isPoLocked}
                                     />
                                   ) : (
-                                    entry.bin || "—"
+                                    entry[field] || "—"
                                   )}
                                 </td>
+                              ))}
 
-                                <td>
+                              <td>{selectedCard.area}</td>
+
+                              <td>
+                                {isBlank && !selectedCard.is_recount && !isReadOnly ? (
+                                  <input
+                                    value={entry.bin}
+                                    onChange={event =>
+                                      updateEntry(line.id, "bin", event.target.value)
+                                    }
+                                    placeholder="Bin"
+                                    readOnly={isPoLocked}
+                                    disabled={isPoLocked}
+                                  />
+                                ) : (
+                                  entry.bin || "—"
+                                )}
+                              </td>
+
+                              <td>
+                                {!canEditQty ? (
+                                  <span>{entry.qty || "0"}</span>
+                                ) : (
                                   <input
                                     type="number"
                                     min="0"
                                     step="1"
-                                    value={
-                                      entry.qty
-                                    }
-                                    disabled={
-                                      locked
-                                    }
-                                    onChange={
-                                      event =>
-                                        updateEntry(
-                                          line.id,
-                                          "qty",
-                                          event.target.value
-                                        )
+                                    value={entry.qty}
+                                    onChange={event =>
+                                      updateEntry(line.id, "qty", event.target.value)
                                     }
                                     placeholder="Qty"
+                                    disabled={isPoLocked || isPoOrderRow}
                                   />
-                                </td>
-                              </tr>
-                            );
-                          }
-                        )}
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
 
-                  {!selectedCard.submitted_at && (
-                    <p className="muted">
-                      On blank PIP cards, leave
-                      every unused row completely
-                      empty. Those rows will be
-                      marked VOID upon submission.
-                    </p>
+                  {poChecked && poLines.length > 0 && (
+                    <div className="table-scroll">
+                      <h4>Production Order BOM</h4>
+
+                      <table className="entry-table">
+                        <thead>
+                          <tr>
+                            <th>No.</th>
+                            <th>Material</th>
+                            <th>Description</th>
+                            <th>Printed Qty</th>
+                            <th>Actual Qty</th>
+                          </tr>
+                        </thead>
+
+                        <tbody>
+                          {poLines.map((line, index) => (
+                            <tr key={`${line.material}-${index}`}>
+                              <td>{index + 1}</td>
+                              <td>{line.material}</td>
+                              <td>{line.description}</td>
+                              <td>{line.printedQty}</td>
+                              <td>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  value={line.qty}
+                                  onChange={event =>
+                                    updatePoQty(
+                                      index,
+                                      event.target.value
+                                    )
+                                  }
+                                  placeholder="Qty"
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   )}
 
                   <div className="button-row">
-                    {!selectedCard.submitted_at ? (
-                      <button
-                        className="primary"
-                        onClick={
-                          submitCounts
-                        }
-                        disabled={busy}
-                      >
-                        Submit PIP Card
-                      </button>
-                    ) : (
-                      <p className="muted">
-                        This PIP card has already
-                        been submitted and cannot
-                        be edited.
-                      </p>
-                    )}
+                    <button
+                      className="primary"
+                      onClick={saveCounts}
+                      disabled={
+                        busy ||
+                        Boolean(selectedCard.submitted_at && !selectedCard.is_recount)
+                      }
+                    >
+                      {selectedCard.is_recount
+                        ? "Submit Recount"
+                        : selectedCard.submitted_at
+                          ? "Confirmed - Read Only"
+                          : "Save Physical Counts"}
+                    </button>
                   </div>
                 </section>
               )}
@@ -3008,6 +3527,31 @@ function App() {
         </div>
       )}
     </div>
+  );
+
+  return (
+    <Routes>
+      <Route
+        path="/login"
+        element={
+          user ? <Navigate to="/" replace /> : loginScreen
+        }
+      />
+
+      <Route
+        path="/"
+        element={
+          user ? dashboardScreen : <Navigate to="/login" replace />
+        }
+      />
+
+      <Route
+        path="*"
+        element={
+          <Navigate to={user ? "/" : "/login"} replace />
+        }
+      />
+    </Routes>
   );
 }
 
