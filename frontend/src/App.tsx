@@ -33,6 +33,7 @@ type MaterialLine = {
   material: string;
   description: string;
   bin: string;
+  location_type?: string;
   plant: string;
   stock_category: string;
   batch: string;
@@ -292,7 +293,7 @@ function PipCardSheet({
             <th>No.</th>
             <th>Material Number</th>
             <th>Material Description</th>
-            <th>Storage Bin</th>
+            <th>Storage Bin / Station</th>
             <th>Physical Count</th>
             <th>Leader Count</th>
           </tr>
@@ -328,7 +329,13 @@ function PipCardSheet({
                   <td>{index + 1}</td>
                   <td>{line?.material ?? ""}</td>
                   <td>{line?.description ?? ""}</td>
-                  <td>{line?.bin ?? ""}</td>
+                  <td>
+                    {line?.location_type === "station"
+                      ? `${line.bin}`
+                      : line?.location_type === "bin"
+                        ? `${line.bin}`
+                        : line?.bin ?? ""}
+                  </td>
                   <td className="count-space"></td>
                   <td className="leader-count-space"></td>
                 </tr>
@@ -3312,7 +3319,7 @@ function App() {
                           <th>Material</th>
                           <th>Description</th>
                           <th>PSA</th>
-                          <th>Bin</th>
+                          <th>Storage Bin / Station</th>
                           <th>Physical Qty</th>
                         </tr>
                       </thead>
@@ -3396,7 +3403,11 @@ function App() {
                                     disabled={isPoLocked}
                                   />
                                 ) : (
-                                  entry.bin || "—"
+                                  line.location_type === "station"
+                                    ? `${entry.bin}`
+                                    : line.location_type === "bin"
+                                      ? `${entry.bin}`
+                                      : entry.bin || "—"
                                 )}
                               </td>
 
