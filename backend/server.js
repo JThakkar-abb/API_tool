@@ -89,6 +89,7 @@ function addGeneratedCards({ batchId, cards = [] }) {
         material: line.material || "",
         description: line.description || "",
         bin: line.bin || "",
+        location_type: line.location_type || "",
         plant: line.plant || "",
         stock_category: line.stock_category || "",
         batch: line.batch || "",
@@ -204,6 +205,31 @@ async function ensureFinanceTables() {
   return financeTablesPromise;
 }
 
+let ticketLocationColumnsReady = false;
+let ticketLocationColumnsPromise = null;
+
+async function ensureTicketLocationColumns() {
+  if (ticketLocationColumnsReady) return;
+  if (ticketLocationColumnsPromise) return ticketLocationColumnsPromise;
+
+  ticketLocationColumnsPromise = (async () => {
+    const pool = await getSqlPool();
+    await pool.request().query(`
+      IF COL_LENGTH(N'INV.Tickets', N'LocationType') IS NULL
+        ALTER TABLE INV.Tickets ADD LocationType NVARCHAR(16) NULL;
+
+      IF COL_LENGTH(N'INV.Tickets', N'LocationValue') IS NULL
+        ALTER TABLE INV.Tickets ADD LocationValue NVARCHAR(128) NULL;
+    `);
+    ticketLocationColumnsReady = true;
+  })().catch(error => {
+    ticketLocationColumnsPromise = null;
+    throw error;
+  });
+
+  return ticketLocationColumnsPromise;
+}
+
 app.use(express.json({ limit: "1mb" }));
 
 app.use(session({
@@ -311,6 +337,67 @@ function formatBinWithStation(bin, station) {
   if (!cleanedStation) return cleanedBin;
 
   return `${cleanedBin} - ${cleanedStation}`;
+}
+
+function splitLocationValues(value, splitWhitespaceSeparatedBins = false) {
+  return clean(value)
+    .split(/[;,]/)
+    .flatMap(segment => {
+      const item = segment.trim().replace(/^bin:\s*/i, "");
+      const tokens = item.split(/\s+/);
+      const isBinList = splitWhitespaceSeparatedBins &&
+        tokens.length > 1 &&
+        tokens.every(token => /^[A-Z]\.\d+(?:\.\d+)+$/i.test(token));
+
+      return isBinList ? tokens : [item];
+    })
+    .filter(item => item && !/^#N\/A$/i.test(item));
+}
+
+function expandMaterialLocations(materials) {
+  const groupedMaterials = new Map();
+
+  for (const material of materials) {
+    const groupKey = [
+      material.material,
+      material.description,
+      material.plant,
+      material.uom,
+      material.location
+    ]
+      .map(clean)
+      .join("\u0000");
+    let group = groupedMaterials.get(groupKey);
+
+    if (!group) {
+      group = { ...material, locations: new Map() };
+      groupedMaterials.set(groupKey, group);
+    }
+
+    for (const value of splitLocationValues(material.bin, true)) {
+      group.locations.set(`bin\u0000${value}`, { type: "bin", value });
+    }
+
+    for (const value of splitLocationValues(material.station)) {
+      group.locations.set(`station\u0000${value}`, { type: "station", value });
+    }
+  }
+
+  return [...groupedMaterials.values()].flatMap(group => {
+    const typeOrder = { bin: 0, station: 1 };
+    const locations = [...group.locations.values()].sort((left, right) =>
+      typeOrder[left.type] - typeOrder[right.type] ||
+      left.value.localeCompare(right.value, undefined, { numeric: true, sensitivity: "base" })
+    );
+    const rows = locations.length ? locations : [{ type: "", value: "" }];
+
+    return rows.map(location => ({
+      ...group,
+      locations: undefined,
+      bin: location.value,
+      location_type: location.type
+    }));
+  });
 }
 
 function normalize(value) {
@@ -432,6 +519,7 @@ async function getCard(code) {
 
 async function getSqlLines(code) {
   const normalized = normalizePipCode(code);
+  await ensureTicketLocationColumns();
   const pool = await getSqlPool();
   const result = await pool.request()
     .input("pipNum", sql.NVarChar, normalized)
@@ -445,6 +533,8 @@ async function getSqlLines(code) {
         COALESCE(pu.UnitMeasurement, 'EA') AS uom,
         t.Status AS status,
         COALESCE(t.Recount, 0) AS recount,
+        t.LocationType AS location_type,
+        t.LocationValue AS location_value,
         MIN(COALESCE(s.Bin, '')) AS bin,
         MIN(COALESCE(s.Station, '')) AS station,
         MAX(b.PI_Card_Qty) AS physical_qty,
@@ -471,22 +561,32 @@ async function getSqlLines(code) {
         pu.Plant,
         pu.UnitMeasurement,
         t.Status,
-        t.Recount
+        t.Recount,
+        t.LocationType,
+        t.LocationValue
       ORDER BY TRY_CAST(t.TicketNumber AS INT), t.TicketNumber
     `);
 
   const isBlank = normalized.includes("-BL");
-  return (result.recordset || []).map((line, index) => ({
-    ...line,
-    line_no: index + 1,
-    id: Number(line.id),
-    status: line.status ?? line.Status ?? null,
-    recount: Number(line.recount ?? line.Recount ?? 0),
-    description: isBlank ? "" : line.description || "",
-    bin: isBlank ? "" : formatBinWithStation(line.bin, line.station),
-    plant: clean(line.plant),
-    uom: clean(line.uom) || "EA"
-  }));
+  return (result.recordset || []).map((line, index) => {
+    const locationType = clean(line.location_type).toLowerCase();
+    const locationValue = clean(line.location_value);
+
+    return {
+      ...line,
+      line_no: index + 1,
+      id: Number(line.id),
+      status: line.status ?? line.Status ?? null,
+      recount: Number(line.recount ?? line.Recount ?? 0),
+      description: isBlank ? "" : line.description || "",
+      bin: isBlank
+        ? ""
+        : locationValue || formatBinWithStation(line.bin, line.station),
+      location_type: locationType,
+      plant: clean(line.plant),
+      uom: clean(line.uom) || "EA"
+    };
+  });
 }
 
 async function getLines(code) {
@@ -793,6 +893,7 @@ async function insertBomComplexCatalogRows({ cardCode, userName, lines = [], car
 }
 
 async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName, lines = [], pipStatus = "pending", cardIndex = 0, poOrder = "", poLines = [], ticketNumbers = [] }) {
+  await ensureTicketLocationColumns();
   const pool = await getSqlPool();
   const sqlPipNum = toSqlPipNum(cardCode);
   const pipStatusValue = String(pipStatus || "pending").toLowerCase() === "confirmed" ? "confirmed" : "pending";
@@ -902,13 +1003,17 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
         .input("lastUpdate", sql.DateTime, new Date())
         .input("ticketNumber", sql.Int, ticketNumber || 0)
         .input("material", sql.NVarChar, material)
+        .input("locationType", sql.NVarChar(16), clean(line.location_type) || null)
+        .input("locationValue", sql.NVarChar(128), clean(line.bin) || null)
         .query(`
           UPDATE INV.Tickets
           SET
             Status = @status,
             TypeOfAdd = @typeOfAdd,
             LastUpdate = @lastUpdate,
-            Material = @material
+            Material = @material,
+            LocationType = CASE WHEN @locationType IS NULL THEN LocationType ELSE @locationType END,
+            LocationValue = CASE WHEN @locationType IS NULL THEN LocationValue ELSE @locationValue END
           WHERE PIPNum = @pipNum AND TicketNumber = @ticketNumber;
         `);
 
@@ -926,6 +1031,8 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
         .input("lastUpdate", sql.DateTime, new Date())
         .input("ticketNumber", sql.Int, ticketNumber || 0)
         .input("material", sql.NVarChar, material)
+        .input("locationType", sql.NVarChar(16), clean(line.location_type) || null)
+        .input("locationValue", sql.NVarChar(128), clean(line.bin) || null)
         .query(`
           INSERT INTO INV.Tickets (
             PIPNum,
@@ -933,7 +1040,9 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
             TypeOfAdd,
             LastUpdate,
             TicketNumber,
-            Material
+            Material,
+            LocationType,
+            LocationValue
           )
           VALUES (
             @pipNum,
@@ -941,7 +1050,9 @@ async function syncCardToInventoryTables({ cardCode, areaName, subArea, userName
             @typeOfAdd,
             @lastUpdate,
             @ticketNumber,
-            @material
+            @material,
+            @locationType,
+            @locationValue
           );
         `);
 
@@ -1024,38 +1135,40 @@ async function fetchProductionAreaMaterials(location, areaId) {
     .input("location", sql.NVarChar, normalizedLocation)
     .input("productionArea", sql.NVarChar, productionAreaName)
     .query(`
-      SELECT
+      SELECT DISTINCT
         p.Material AS material,
         p.MaterialDescription AS description,
-        MIN(COALESCE(s.Bin, '')) AS bin,
-        MIN(COALESCE(s.Station, '')) AS station,
+        COALESCE(s.Bin, '') AS bin,
+        COALESCE(s.Station, '') AS station,
         p.Plant AS plant,
         p.UnitMeasurement AS uom,
         p.Location AS location
       FROM INV.PartUniverse p
-      LEFT JOIN INV.AllStationBinData s
+      INNER JOIN INV.AllStationBinData s
         ON s.Material = p.Material
        AND s.ProductionArea = @productionArea
       WHERE p.Location = @location
-        AND s.Material IS NOT NULL
-      GROUP BY p.Material, p.MaterialDescription, p.Plant, p.UnitMeasurement, p.Location
-      ORDER BY MIN(COALESCE(case when s.Bin = 'Floor' then '_Floor' else s.bin end, '')), p.Material
+      ORDER BY p.Material, bin, station
     `);
 
-  const materials = result.recordset
+  const materials = expandMaterialLocations(result.recordset
     .map(row => ({
       material: clean(row.material),
       description: clean(row.description),
-      bin: formatBinWithStation(row.bin, row.station),
+      bin: clean(row.bin),
+      station: clean(row.station),
       plant: clean(row.plant),
       stock_category: "",
       batch: "",
       uom: clean(row.uom) || "EA",
       sap_qty: null,
       location: clean(row.location)
-    }))
+    })))
     .filter(item => item.material)
     .sort((a, b) => {
+      const locationTypeCompare = Number(a.location_type === "station") - Number(b.location_type === "station");
+      if (locationTypeCompare !== 0) return locationTypeCompare;
+
       const binCompare = String(a.bin || "").localeCompare(String(b.bin || ""), undefined, { numeric: true, sensitivity: "base" });
       if (binCompare !== 0) return binCompare;
       return String(a.material).localeCompare(String(b.material), undefined, { numeric: true, sensitivity: "base" });
@@ -1069,31 +1182,50 @@ async function fetchProductionAreaMaterials(location, areaId) {
 
 function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
   const cards = [];
+  const materialsByLocation = new Map();
 
-  for (let offset = 0; offset < materials.length; offset += 10) {
-    const page = Math.floor(offset / 10) + 1;
-    const code = buildPipCardCode({
-      sloc,
-      areaId,
-      batchId,
-      pageNumber: page
-    });
+  for (const material of materials) {
+    const locationType = clean(material.location_type).toLowerCase();
+    const locationValue = clean(material.bin);
+    const rack = locationValue.split(".")[0].trim();
+    const locationKey = locationType === "station" && locationValue
+      ? `station:${locationValue.toUpperCase()}`
+      : rack
+        ? `rack:${rack.toUpperCase()}`
+        : "unassigned";
+    const group = materialsByLocation.get(locationKey) || [];
+    group.push(material);
+    materialsByLocation.set(locationKey, group);
+  }
 
-    const lines = materials.slice(offset, offset + 10).map((material, index) => ({
-      line_no: index + 1,
-      material: material.material,
-      description: material.description,
-      bin: material.bin,
-      plant: material.plant,
-      stock_category: material.stock_category,
-      batch: material.batch,
-      uom: material.uom,
-      sap_qty: material.sap_qty,
-      physical_qty: null,
-      is_void: 0
-    }));
+  let pageNumber = 0;
+  for (const locationMaterials of materialsByLocation.values()) {
+    for (let offset = 0; offset < locationMaterials.length; offset += 10) {
+      pageNumber += 1;
+      const code = buildPipCardCode({
+        sloc,
+        areaId,
+        batchId,
+        pageNumber
+      });
 
-    cards.push({ code, kind: "filled", lines });
+      const lines = locationMaterials.slice(offset, offset + 10).map((material, index) => ({
+        line_no: index + 1,
+        material: material.material,
+        description: material.description,
+        bin: material.bin,
+        location_type: material.location_type,
+        plant: material.plant,
+        stock_category: material.stock_category,
+        batch: material.batch,
+        uom: material.uom,
+        sap_qty: material.sap_qty,
+        physical_qty: null,
+        is_void: 0
+      }));
+
+      cards.push({ code, kind: "filled", lines });
+    }
   }
 
   return {
@@ -1639,6 +1771,7 @@ app.post(
         description: findColumn("Material Description", "Description", "Material Desc"),
         sloc: findColumn("SLoc", "Storage Location", "Storage Loc"),
         bin: findColumn("Storage Bin", "StorageBin"),
+        station: findColumn("Station"),
         plant: findColumn("Plant", "Plnt"),
         stock: findColumn("Stock Category", "Stock Type", "S"),
         batch: findColumn("Batch"),
@@ -1669,6 +1802,7 @@ app.post(
           material,
           description: clean(getColumn(row, cols.description)),
           bin: clean(getColumn(row, cols.bin)),
+          station: clean(getColumn(row, cols.station)),
           plant: clean(getColumn(row, cols.plant)),
           stock_category: clean(getColumn(row, cols.stock)),
           batch: clean(getColumn(row, cols.batch)),
@@ -1698,7 +1832,7 @@ app.post(
         batchId: batch.id,
         sloc,
         areaId: area.id,
-        materials
+        materials: expandMaterialLocations(materials)
       });
 
       addGeneratedCards({ batchId: batch.id, cards: result.cards });
@@ -2412,17 +2546,36 @@ app.post(
             .query(`
               UPDATE INV.BOM_Complex_Catalog
               SET
-                PI_Card_Qty = @qty,
-                Qty_Withdrawn = @qty,
-                Employee_Alias = @userName,
-                Date_In = GETDATE()
+                Status = 'Cancelled'
               WHERE PI_Card = @pipNum
                 AND TicketNumber = @ticketNumber
                 AND Material = @material
             `);
 
+          const bomResult2 = await transaction.request()
+            .input("pipNum", sql.NVarChar, code)
+            .input("ticketNumber", sql.Int, update.id)
+            .input("material", sql.NVarChar, update.material)
+            .input("qty", sql.Decimal(8, 2), update.qty)
+            .input("userName", sql.NVarChar, clean(userName))
+            .query(`
+              Insert into INV.BOM_Complex_Catalog
+              (
+                Select * from INV.BOM_Complex_Catalog
+                WHERE PI_Card = @pipNum
+                  AND TicketNumber = @ticketNumber
+                  AND Material = @material
+              )
+            `);
+
           if (!bomResult.rowsAffected[0]) {
             const error = new Error(`No BOM row found for material ${update.material} on this PIP card`);
+            error.statusCode = 409;
+            throw error;
+          }
+
+          if (!bomResult2.rowsAffected[0]) {
+            const error = new Error(`Failed to insert BOM row for material ${update.material} on this PIP card`);
             error.statusCode = 409;
             throw error;
           }
@@ -2731,6 +2884,7 @@ app.post(
           material: match ? match.material : line.material,
           description: match ? match.description : line.description,
           bin: match ? match.bin : line.bin,
+          location_type: line.location_type,
           is_void: match ? Number(match.isVoid) === 1 : Number(line.is_void) === 1,
           qty,
           physical_qty: qty
