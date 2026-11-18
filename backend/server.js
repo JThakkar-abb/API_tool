@@ -12,6 +12,9 @@ const sqlQueries = require("./mssql/queries.js");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const app = express();
+const IS_PRODUCTION =
+  process.env.NODE_ENV === "production" ||
+  !!process.env.IISNODE_VERSION;
 const PORT = 3001;
 const LOCATIONS = ["1000", "2000", "3000", "5000"];
 
@@ -244,24 +247,79 @@ app.use(session({
 }));
 
 
-const users = [
-  {
-    username: "manager",
-    role: "manager",
-    hash: bcrypt.hashSync(
-      process.env.MANAGER_PASSWORD,
-      10
-    )
-  },
-  {
-    username: "auditor",
-    role: "auditor",
-    hash: bcrypt.hashSync(
-      process.env.AUDITOR_PASSWORD,
-      10
-    )
+const localUsers = !IS_PRODUCTION
+  ? [
+      {
+        username: "manager",
+        role: "manager",
+        hash: bcrypt.hashSync(
+          process.env.MANAGER_PASSWORD,
+          10
+        )
+      },
+      {
+        username: "auditor",
+        role: "auditor",
+        hash: bcrypt.hashSync(
+          process.env.AUDITOR_PASSWORD,
+          10
+        )
+      }
+    ]
+  : [];
+
+function getIisWindowsIdentity(req) {
+  const identity =
+    req.headers["x-iis-windows-user"] ||
+    req.headers["x-iisnode-auth_user"] ||
+    req.headers["x-iisnode-logon_user"] ||
+    req.headers["x-iisnode-remote_user"] ||
+    req.headers["remote-user"];
+
+  if (typeof identity !== "string") return "";
+
+  return identity
+    .replace(/^.*\\/, "")
+    .replace(/^.+@[^@]+$/, value => value.split("@")[0])
+    .trim()
+    .toLowerCase();
+}
+
+function mapAuthorizedLevel(level) {
+  const normalized = String(level || "").trim().toLowerCase();
+
+  if (["admin", "manager", "finance"].includes(normalized)) {
+    return "manager";
   }
-];
+
+  if (normalized === "auditor") {
+    return "auditor";
+  }
+
+  return null;
+}
+
+async function findWindowsUser(username) {
+  const pool = await getSqlPool();
+  const result = await pool.request()
+    .input("alias", sql.NVarChar(128), username)
+    .query(`
+      SELECT TOP 1 Alias, Level
+      FROM Engineering.INV.Users
+      WHERE LOWER(LTRIM(RTRIM(Alias))) = @alias
+    `);
+
+  const row = result.recordset[0];
+  if (!row) return null;
+
+  const role = mapAuthorizedLevel(row.Level);
+  if (!role) return null;
+
+  return {
+    username: String(row.Alias).trim(),
+    role
+  };
+}
 
 /* =====================================
    FINANCE ACCESS CONFIGURATION
@@ -1270,26 +1328,56 @@ function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
   };
 }
 
-app.post("/api/login", (req, res) => {
-  const { username, password } = req.body || {};
+app.post("/api/login", async (req, res) => {
+  const windowsUsername = getIisWindowsIdentity(req);
+  let user = null;
 
-  const user = users.find(
-    item => item.username === username
-  );
+  if (windowsUsername) {
+    try {
+      user = await findWindowsUser(windowsUsername);
+    } catch (error) {
+      console.error("Windows user lookup failed:", error.message);
+      return res.status(503).json({
+        message: "Unable to verify the Windows user"
+      });
+    }
 
-  if (
-    !user ||
-    typeof password !== "string" ||
-    !bcrypt.compareSync(password, user.hash)
-  ) {
-    writeLog({
-      activity: "login_failed",
-      userName: typeof username === "string" ? username : "unknown",
-      message: "Invalid username or password"
-    });
+    if (!user) {
+      writeLog({
+        activity: "login_failed",
+        userName: windowsUsername,
+        message: "Windows account missing or role not authorized"
+      });
 
+      return res.status(403).json({
+        message: "Your Windows account is not authorized"
+      });
+    }
+  } else if (!IS_PRODUCTION) {
+    const { username, password } = req.body || {};
+
+    user = localUsers.find(
+      item => item.username === username
+    );
+
+    if (
+      !user ||
+      typeof password !== "string" ||
+      !bcrypt.compareSync(password, user.hash)
+    ) {
+      writeLog({
+        activity: "login_failed",
+        userName: typeof username === "string" ? username : "unknown",
+        message: "Invalid username or password"
+      });
+
+      return res.status(401).json({
+        message: "Invalid username or password"
+      });
+    }
+  } else {
     return res.status(401).json({
-      message: "Invalid username or password"
+      message: "Windows authentication is required"
     });
   }
 
@@ -3508,8 +3596,27 @@ app.get(
 );
 
 
-app.listen(PORT, () => {
+const frontendDist = path.resolve(__dirname, "..", "frontend", "dist");
+
+if (IS_PRODUCTION) {
+  app.use(express.static(frontendDist));
+
+  app.use((req, res, next) => {
+    if (req.method !== "GET") return next();
+
+    const accept = String(req.headers.accept || "");
+    if (!accept.includes("text/html")) return next();
+
+    res.sendFile(path.join(frontendDist, "index.html"), error => {
+      if (error) next(error);
+    });
+  });
+}
+
+const listenPort = process.env.PORT || PORT;
+
+app.listen(listenPort, () => {
   console.log(
-    `ABB PIP Audit backend running at http://localhost:${PORT}`
+    `ABB PIP Audit backend running on port ${listenPort}`
   );
 });

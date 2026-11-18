@@ -1283,7 +1283,21 @@ function App() {
   useEffect(() => {
     api("/me")
       .then(setUser)
-      .catch(() => setUser(null))
+      .catch(async () => {
+        try {
+          const authenticatedUser = await api("/login", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({})
+          });
+
+          setUser(authenticatedUser);
+        } catch {
+          setUser(null);
+        }
+      })
       .finally(() => setChecking(false));
   }, []);
 
