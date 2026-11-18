@@ -1111,6 +1111,41 @@ function getAreaLeaders(area) {
   ].filter(leader => leader.name);
 }
 
+async function fetchAllCompletedMaterials() {
+  const pool = await getSqlPool();
+
+  const result = await pool.request()
+    .query(`
+      SELECT *
+      FROM INV.Tickets a
+      Left JOIN INV.BOM_COMPLEX_CATALOG b on a.PipNum+a.Material = b.PipNum+b.Material
+    `);
+
+
+  return [];
+}
+
+async function fetchCostByMaterial() {
+  const pool = await getSqlPool();
+
+  const result = await pool.request()
+    .query(`
+      SELECT 
+        a.Material,
+        SUM(p.MaterialCost) AS totalCostCounted,
+        p.Material AS materialCost,
+        sum(p.COST) AS totalCost
+        FROM INV.BOM_COMPLEX_CATALOG a
+          right join INV.PartUniverse p on a.Material = p.Material
+        GROUP BY a.Material, p.Material
+    `);
+
+
+  return [];
+}
+
+
+
 async function fetchProductionAreaMaterials(location, areaId) {
   const normalizedLocation = clean(location);
   const area = await findArea(Number(areaId));
@@ -1991,16 +2026,16 @@ app.post(
             id: nextLineId++,
             card_id: 0,
             line_no: lineIndex + 1,
-            material: "",
-            description: "",
-            bin: "",
-            plant: "",
-            stock_category: "",
-            batch: "",
-            uom: "EA",
-            sap_qty: null,
-            physical_qty: null,
-            is_void: 0,
+            material: lineIndex>0 ? 'VOID' : '',
+            description: lineIndex>0 ? 'VOID' : '',
+            bin: lineIndex>0 ? 'VOID' : '',
+            plant: lineIndex>0 ? 'VOID' : '',
+            stock_category: lineIndex>0 ? 'VOID' : '',
+            batch: lineIndex>0 ? 'VOID' : '',
+            uom: lineIndex>0 ? 'VOID' : '',
+            sap_qty: lineIndex>0 ? 0 : null,
+            physical_qty: lineIndex>0 ? 0 : null,
+            is_void: lineIndex>0 ? 1 : 0,
             entered_by: null,
             entered_at: null
           }))
@@ -2754,10 +2789,21 @@ app.post(
           isVoid = false;
           qty = 0;
         } else {
+          material = "";
+          description = "";
+          bin = "";
           isVoid = true;
           qty = null;
         }
       } else {
+        if (blankCard && lineIndex > 0) {
+          material = "";
+          description = "";
+          bin = "";
+          isVoid = true;
+          qty = null;
+        }
+
         if (
           material.length > 120 ||
           description.length > 500 ||

@@ -302,9 +302,9 @@ function PipCardSheet({
         <tbody>
           {rows.map((line, index) => {
               const voidRow =
-                isBlank &&
+                (isBlank &&
                 isSubmitted &&
-                line?.is_void === 1;
+                line?.is_void === 1) || line?.material === "VOID";
 
               if (voidRow) {
                 return (
@@ -1001,7 +1001,6 @@ function FinanceMonitoring({
                     <th>Pending</th>
                     <th>Completion</th>
                     <th>Recount Eligibility</th>
-                    <th>Request Recount</th>
                   </tr>
                 </thead>
 
@@ -1058,15 +1057,6 @@ function FinanceMonitoring({
                               ? "Eligible"
                               : "Locked"}
                           </span>
-                        </td>
-                        <td>
-                          <button
-                            type="button"
-                            className="secondary"
-                            disabled={!eligible}
-                          >
-                            Request Recount
-                          </button>
                         </td>
                       </tr>
                     );
@@ -2295,14 +2285,15 @@ function App() {
       }
     }
 
-    const voided = !selectedCard.is_recount && !poChecked && selectedCard.kind === "blank"
-      ? submitted.filter(item => !item.material.trim() && !item.description.trim() && !item.bin.trim() && item.qty === null).length
-      : 0;
+    const isBlankCardSubmission =
+      !selectedCard.is_recount && selectedCard.kind === "blank";
+
+    const voided = isBlankCardSubmission ? 9 : 0;
     const counted = selectedCard.is_recount
       ? recountRows.length
-      : poChecked
-        ? countedPo.length
-        : submitted.length - voided;
+      : isBlankCardSubmission
+        ? 1
+        : submitted.length;
 
     if (!counted) {
       setError("Enter at least one material.");
@@ -3059,7 +3050,7 @@ function App() {
                       event.stopPropagation()
                     }
                   >
-                    <h3>recount PIP Card</h3>
+                    <h3>Recount PIP Card</h3>
 
                     <p className="muted">
                       Select a previously generated PIP
@@ -3318,7 +3309,6 @@ function App() {
                           <th>No.</th>
                           <th>Material</th>
                           <th>Description</th>
-                          <th>PSA</th>
                           <th>Storage Bin / Station</th>
                           <th>Physical Qty</th>
                         </tr>
@@ -3337,7 +3327,7 @@ function App() {
                           const isBlank =
                             selectedCard.kind === "blank";
                           const isReadOnly = Boolean(
-                            selectedCard.submitted_at && !selectedCard.is_recount
+                            (selectedCard.submitted_at && !selectedCard.is_recount) || line.line_no !== 1
                           );
                           const isRecountLine =
                             Number(line.recount) === 1 &&
@@ -3347,21 +3337,26 @@ function App() {
                             : !isReadOnly;
                           const canEditQty = canEditLine;
                           const isPoLocked =
-                            poChecked && line.line_no !== 1;
+                            (poChecked) && line.line_no !== 1;
                           const isPoOrderRow =
-                            poChecked && line.line_no === 1;
+                            (poChecked) && line.line_no === 1;
 
-                          if (line.is_void === 1) {
+                          if (line.is_void === 1 || line.material == "VOID") {
                             return (
                               <tr
                                 key={line.id}
                                 className="pip-void-row"
                               >
                                 <td>{line.line_no}</td>
-                                <td colSpan={5}>VOID</td>
+                                <td colSpan={4}>VOID</td>
                               </tr>
                             );
                           }
+
+                            function upperFirst(field: string): string | undefined {
+                              if (!field) return undefined;
+                              return field.charAt(0).toUpperCase() + field.slice(1);
+                            }
 
                           return (
                             <tr key={line.id}>
@@ -3378,7 +3373,7 @@ function App() {
                                       placeholder={
                                         isPoOrderRow && field === "material"
                                           ? "Production Order #"
-                                          : field
+                                          : upperFirst(field)
                                       }
                                       readOnly={isPoLocked}
                                       disabled={isPoLocked}
@@ -3388,8 +3383,6 @@ function App() {
                                   )}
                                 </td>
                               ))}
-
-                              <td>{selectedCard.area}</td>
 
                               <td>
                                 {isBlank && !selectedCard.is_recount && !isReadOnly ? (
