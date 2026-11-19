@@ -670,10 +670,308 @@ function ManagerOverview({
   );
 }
 
-// =====================================================
-// FINANCE: SAP UPLOAD + PSA MONITORING
-// =====================================================
+function FinanceReconciliation({
+  uploads,
+  cards,
+}: {
+  uploads: FinanceUpload[];
+  cards: OverviewCard[];
+}) {
+  const [selectedPsa, setSelectedPsa] = useState("");
+  const [uploadChoice, setUploadChoice] = useState("");
+  const [rows, setRows] = useState<FinanceMaterial[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busyMaterial, setBusyMaterial] = useState("");
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [refresh, setRefresh] = useState(0);
 
+  const psaOptions = new Map<string, OverviewCard>();
+
+  for (const card of cards) {
+    if (!card.area || !card.sloc) continue;
+
+    const key = JSON.stringify([card.area, card.sloc]);
+    if (!psaOptions.has(key) || card.submitted_at) {
+      psaOptions.set(key, card);
+    }
+  }
+
+  const psaEntries = [...psaOptions.entries()];
+  const defaultPsa =
+    psaEntries.find(([, card]) => card.submitted_at)?.[0] ??
+    psaEntries[0]?.[0] ??
+    "";
+
+  const psaKey = psaOptions.has(selectedPsa) ? selectedPsa : defaultPsa;
+  const selectedCard = psaOptions.get(psaKey);
+  const psa = selectedCard?.area ?? "";
+  const sloc = selectedCard?.sloc ?? "";
+
+  const uploadId = uploads.some(upload => String(upload.id) === uploadChoice)
+    ? uploadChoice
+    : String(uploads[0]?.id ?? "");
+
+  useEffect(() => {
+    setRows([]);
+    setError("");
+
+    if (!psa || !sloc) {
+      setLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const params = new URLSearchParams({ psa, sloc });
+    if (uploadId) params.set("uploadId", uploadId);
+
+    setLoading(true);
+
+    api(`/finance/reconciliation?${params.toString()}`, {
+      signal: controller.signal,
+    })
+      .then((data: FinanceMaterial[]) => {
+        if (!controller.signal.aborted) setRows(data);
+      })
+      .catch((err: Error) => {
+        if (!controller.signal.aborted) setError(err.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [psa, sloc, uploadId, refresh]);
+
+  async function requestRecount(material: string) {
+    if (!psa || !sloc || !uploadId || loading || busyMaterial) return;
+
+    setBusyMaterial(material);
+    setError("");
+    setMessage("");
+
+    try {
+      const result: { tickets: number } = await api(
+        "/finance/reconciliation/recount",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            psa,
+            sloc,
+            uploadId: Number(uploadId),
+            material,
+          }),
+        }
+      );
+
+      setRows(current =>
+        current.map(row =>
+          row.material === material
+            ? { ...row, requested: 1, can_recount: 0 }
+            : row
+        )
+      );
+
+      setMessage(
+        `${material}: ${result.tickets} ticket(s) flagged in PIP Card Management.`
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusyMaterial("");
+    }
+  }
+
+  function displayNumber(value: number | null, isCost = false) {
+    if (value === null) return "—";
+
+    return value.toLocaleString("en-US", {
+      minimumFractionDigits: isCost ? 2 : 0,
+      maximumFractionDigits: isCost ? 2 : 8,
+    });
+  }
+
+  function difference(row: FinanceMaterial) {
+    const { counted_qty: counted, sap_qty: sap } = row;
+
+    if (counted === null || sap === null) return "—";
+    if (counted === sap) return "0.0%";
+    if (sap === 0) return "N/A";
+
+    const percentage = ((counted - sap) / Math.abs(sap)) * 100;
+    return `${percentage > 0 ? "+" : ""}${percentage.toFixed(1)}%`;
+  }
+
+  const comparedRows = rows.filter(
+    row => row.counted_qty !== null && row.sap_qty !== null
+  );
+  const matchedCount = comparedRows.filter(
+    row => row.counted_qty === row.sap_qty
+  ).length;
+  const mismatchCount = comparedRows.length - matchedCount;
+  const requestedCount = rows.filter(row => row.requested > 0).length;
+
+  return (
+    <>
+      <h3>Material Reconciliation</h3>
+
+      <div className="overview-kpis">
+        <div className="overview-kpi">
+          <span>Total Materials</span>
+          <strong>{rows.length}</strong>
+        </div>
+
+        <div className="overview-kpi submitted">
+          <span>Matched Materials</span>
+          <strong>{matchedCount}</strong>
+        </div>
+
+        <div className="overview-kpi pending">
+          <span>Quantity Mismatches</span>
+          <strong>{mismatchCount}</strong>
+        </div>
+
+        <div className="overview-kpi">
+          <span>Recounts Requested</span>
+          <strong>{requestedCount}</strong>
+        </div>
+      </div>
+
+      <div className="finance-sap-form">
+        <div className="finance-sap-field">
+          <label htmlFor="financeReconciliationPsa">
+            Production Supply Area
+          </label>
+          <select
+            id="financeReconciliationPsa"
+            value={psaKey}
+            disabled={!psaEntries.length || !!busyMaterial}
+            onChange={event => {
+              setMessage("");
+              setSelectedPsa(event.target.value);
+            }}
+          >
+            {!psaEntries.length && <option value="">No PSAs available</option>}
+
+            {psaEntries.map(([key, card]) => (
+              <option key={key} value={key}>
+                {card.area} ({card.sloc})
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="finance-sap-field">
+          <label htmlFor="financeReconciliationUpload">SAP Upload</label>
+          <select
+            id="financeReconciliationUpload"
+            value={uploads.some(upload => String(upload.id) === uploadChoice)
+              ? uploadChoice
+              : ""}
+            disabled={!uploads.length || !!busyMaterial}
+            onChange={event => {
+              setMessage("");
+              setUploadChoice(event.target.value);
+            }}
+          >
+            <option value="">
+              {uploads.length ? "Latest upload" : "No SAP uploads yet"}
+            </option>
+
+            {uploads.map(upload => (
+              <option key={upload.id} value={upload.id}>
+                #{upload.id} · {upload.snapshot_date?.slice(0, 10) ?? upload.filename}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        className="secondary"
+        disabled={!psa || loading || !!busyMaterial}
+        onClick={() => {
+          setMessage("");
+          setRefresh(current => current + 1);
+        }}
+      >
+        {loading ? "Loading Materials..." : "Refresh Materials"}
+      </button>
+
+      {error && <p role="alert">{error}</p>}
+      {message && <p role="status">{message}</p>}
+
+      <div className="table-scroll">
+        <table className="overview-table">
+          <thead>
+            <tr>
+              <th>Materials</th>
+              <th>Total Counting QTY</th>
+              <th>Cost</th>
+              <th>SAP QTY</th>
+              <th>SAP Cost</th>
+              <th>Difference in %</th>
+              <th>Recount</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {rows.map(row => (
+              <tr key={row.material}>
+                <td><strong>{row.material}</strong></td>
+                <td>{displayNumber(row.counted_qty)}</td>
+                <td>{displayNumber(row.counted_cost, true)}</td>
+                <td>{displayNumber(row.sap_qty)}</td>
+                <td>{formatMoney(row.sap_cost, row.currency)}</td>
+                <td>{difference(row)}</td>
+                <td>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={
+                      !uploadId ||
+                      row.can_recount !== 1 ||
+                      loading ||
+                      !!busyMaterial
+                    }
+                    onClick={() => void requestRecount(row.material)}
+                  >
+                    {row.requested > 0
+                      ? "Requested"
+                      : busyMaterial === row.material
+                        ? "Requesting..."
+                        : "Request Recount"}
+                  </button>
+                </td>
+              </tr>
+            ))}
+
+            {!rows.length && (
+              <tr>
+                <td colSpan={7}>
+                  {loading
+                    ? "Loading submitted materials..."
+                    : error
+                      ? "Unable to load submitted materials."
+                      : !psa
+                        ? "No Production Supply Areas available."
+                        : "No submitted PIP materials for this PSA."}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="muted">
+        Counting totals reflect submitted PIPs in the selected PSA.
+        SAP comparison values appear when a matching upload is available.
+      </p>
+    </>
+  );
+}
 function FinanceMonitoring({
   overview,
   overviewLoading,
@@ -690,130 +988,86 @@ function FinanceMonitoring({
   sapUploadsLoading,
   onRefreshUploads,
   sapUploadMessage,
-  sapUploadError
+  sapUploadError,
 }: {
   overview: OverviewData | null;
   overviewLoading: boolean;
   onRefresh: () => void;
-
   sapFile: File | null;
   onFileChange: (file: File | null) => void;
-
   sapCutoffDate: string;
   onDateChange: (value: string) => void;
-
   sapCurrency: string;
   onCurrencyChange: (value: string) => void;
-
   sapUploading: boolean;
   onUpload: (event: FormEvent<HTMLFormElement>) => void;
-
   sapUploads: FinanceUpload[];
   sapUploadsLoading: boolean;
   onRefreshUploads: () => void;
-
   sapUploadMessage: string;
   sapUploadError: string;
 }) {
   const completedPsaCount =
     overview?.byPsa.filter(
-      area =>
-        area.generated > 0 &&
-        area.submitted === area.generated
+      area => area.generated > 0 && area.submitted === area.generated
     ).length ?? 0;
 
   return (
     <div className="finance-monitoring">
-
-      {/* =====================================
-          SAP INVENTORY UPLOAD
-      ===================================== */}
-
+      {/* SAP INVENTORY UPLOAD */}
       <section className="finance-sap-upload">
         <div className="finance-sap-heading">
           <h3>SAP Inventory Data Upload</h3>
-
           <p className="muted">
-            Upload the official SAP inventory report
-            containing material quantities and
-            inventory values.
+            Upload the official SAP inventory report containing material
+            quantities and inventory values.
           </p>
         </div>
 
-        <form
-          className="finance-sap-form"
-          onSubmit={onUpload}
-        >
+        <form className="finance-sap-form" onSubmit={onUpload}>
           <div className="finance-sap-field">
-            <label htmlFor="sapExcelFile">
-              SAP Inventory Excel File
-            </label>
-
+            <label htmlFor="sapExcelFile">SAP Inventory Excel File</label>
             <input
               id="sapExcelFile"
               type="file"
               accept=".xlsx"
               disabled={sapUploading}
               onChange={event =>
-                onFileChange(
-                  event.target.files?.[0] || null
-                )
+                onFileChange(event.target.files?.[0] ?? null)
               }
               required
             />
 
             {sapFile && (
-              <small className="muted">
-                Selected: {sapFile.name}
-              </small>
+              <small className="muted">Selected: {sapFile.name}</small>
             )}
           </div>
 
           <div className="finance-sap-fields">
             <div className="finance-sap-field">
-              <label htmlFor="sapCutoffDate">
-                Inventory Cutoff Date
-              </label>
-
+              <label htmlFor="sapCutoffDate">Inventory Cutoff Date</label>
               <input
                 id="sapCutoffDate"
                 type="date"
                 value={sapCutoffDate}
-                onChange={event =>
-                  onDateChange(event.target.value)
-                }
+                onChange={event => onDateChange(event.target.value)}
                 disabled={sapUploading}
                 required
               />
             </div>
 
             <div className="finance-sap-field">
-              <label htmlFor="sapCurrency">
-                Inventory Currency
-              </label>
-
+              <label htmlFor="sapCurrency">Inventory Currency</label>
               <select
                 id="sapCurrency"
                 value={sapCurrency}
-                onChange={event =>
-                  onCurrencyChange(
-                    event.target.value
-                  )
-                }
+                onChange={event => onCurrencyChange(event.target.value)}
                 disabled={sapUploading}
               >
-                <option value="USD">
-                  USD — US Dollar
-                </option>
-                <option value="EUR">
-                  EUR — Euro
-                </option>
-                <option value="INR">
-                  INR — Indian Rupee
-                </option>
-                <option value="GBP">
-                  GBP — British Pound
-                </option>
+                <option value="USD">USD — US Dollar</option>
+                <option value="EUR">EUR — Euro</option>
+                <option value="INR">INR — Indian Rupee</option>
+                <option value="GBP">GBP — British Pound</option>
               </select>
             </div>
           </div>
@@ -821,32 +1075,21 @@ function FinanceMonitoring({
           <button
             type="submit"
             className="primary"
-            disabled={
-              sapUploading ||
-              !sapFile ||
-              !sapCutoffDate
-            }
+            disabled={sapUploading || !sapFile || !sapCutoffDate}
           >
-            {sapUploading
-              ? "Uploading SAP Inventory..."
-              : "Upload SAP Inventory"}
+            {sapUploading ? "Uploading SAP Inventory..." : "Upload SAP Inventory"}
           </button>
         </form>
 
         {sapUploadMessage && (
-          <div className="success-message">
-            {sapUploadMessage}
-          </div>
+          <div className="success-message">{sapUploadMessage}</div>
         )}
 
         {sapUploadError && (
-          <div className="error-message">
-            {sapUploadError}
-          </div>
+          <div className="error-message">{sapUploadError}</div>
         )}
 
         {/* SAP UPLOAD HISTORY */}
-
         <div className="finance-upload-history">
           <div className="finance-history-title">
             <h3>SAP Upload History</h3>
@@ -857,9 +1100,7 @@ function FinanceMonitoring({
               onClick={onRefreshUploads}
               disabled={sapUploadsLoading}
             >
-              {sapUploadsLoading
-                ? "Refreshing..."
-                : "Refresh History"}
+              {sapUploadsLoading ? "Refreshing..." : "Refresh History"}
             </button>
           </div>
 
@@ -881,32 +1122,11 @@ function FinanceMonitoring({
                 {sapUploads.map(upload => (
                   <tr key={upload.id}>
                     <td>{upload.id}</td>
-
-                    <td>
-                      {formatFilename(
-                        upload.filename
-                      )}
-                    </td>
-
-                    <td>
-                      {upload.snapshot_date || "—"}
-                    </td>
-
-                    <td>
-                      {upload.materials}
-                    </td>
-
-                    <td>
-                      {formatMoney(
-                        upload.total_value,
-                        upload.currency
-                      )}
-                    </td>
-
-                    <td>
-                      {upload.currency || "—"}
-                    </td>
-
+                    <td>{formatFilename(upload.filename)}</td>
+                    <td>{upload.snapshot_date || "—"}</td>
+                    <td>{upload.materials}</td>
+                    <td>{formatMoney(upload.total_value, upload.currency)}</td>
+                    <td>{upload.currency || "—"}</td>
                     <td>
                       <span className="status-chip status-submitted">
                         {upload.status}
@@ -930,18 +1150,13 @@ function FinanceMonitoring({
         </div>
       </section>
 
-      {/* =====================================
-          PLANT AUDIT MONITORING
-      ===================================== */}
-
+      {/* PLANT AUDIT MONITORING */}
       <section className="panel">
         <div className="finance-history-title">
           <div>
             <h3>Plant Audit Monitoring</h3>
-
             <p className="muted">
-              Monitor original PIP card submission
-              progress for each Production Supply Area.
+              Monitor PIP card submissions for each Production Supply Area.
             </p>
           </div>
 
@@ -951,9 +1166,7 @@ function FinanceMonitoring({
             onClick={onRefresh}
             disabled={overviewLoading}
           >
-            {overviewLoading
-              ? "Refreshing..."
-              : "Refresh Audit Status"}
+            {overviewLoading ? "Refreshing..." : "Refresh Audit Status"}
           </button>
         </div>
 
@@ -962,30 +1175,22 @@ function FinanceMonitoring({
             <div className="overview-kpis">
               <div className="overview-kpi">
                 <span>Total PIP Generated</span>
-                <strong>
-                  {overview.summary.generated}
-                </strong>
+                <strong>{overview.summary.generated}</strong>
               </div>
 
               <div className="overview-kpi submitted">
                 <span>PIP Submitted</span>
-                <strong>
-                  {overview.summary.submitted}
-                </strong>
+                <strong>{overview.summary.submitted}</strong>
               </div>
 
               <div className="overview-kpi pending">
                 <span>Pending PIP</span>
-                <strong>
-                  {overview.summary.pending}
-                </strong>
+                <strong>{overview.summary.pending}</strong>
               </div>
 
               <div className="overview-kpi">
                 <span>Completed PSAs</span>
-                <strong>
-                  {completedPsaCount}
-                </strong>
+                <strong>{completedPsaCount}</strong>
               </div>
             </div>
 
@@ -1006,56 +1211,31 @@ function FinanceMonitoring({
 
                 <tbody>
                   {overview.byPsa.map(area => {
-                    const completion =
-                      area.generated > 0
-                        ? (
-                            area.submitted /
-                            area.generated
-                          ) * 100
-                        : 0;
-
+                    const completion = area.generated > 0
+                      ? (area.submitted / area.generated) * 100
+                      : 0;
                     const eligible =
-                      area.generated > 0 &&
-                      area.submitted ===
-                        area.generated;
+                      area.generated > 0 && area.submitted === area.generated;
 
                     return (
                       <tr key={area.area}>
-                        <td>
-                          <strong>
-                            {area.area}
-                          </strong>
-                        </td>
-
+                        <td><strong>{area.area}</strong></td>
                         <td>{area.generated}</td>
                         <td>{area.submitted}</td>
                         <td>{area.pending}</td>
-
                         <td>
                           <div className="psa-progress">
-                            <div
-                              style={{
-                                width: `${completion}%`
-                              }}
-                            />
+                            <div style={{ width: `${completion}%` }} />
                           </div>
-
-                          <small>
-                            {completion.toFixed(1)}%
-                          </small>
+                          <small>{completion.toFixed(1)}%</small>
                         </td>
-
                         <td>
                           <span
-                            className={
-                              eligible
-                                ? "status-chip status-submitted"
-                                : "status-chip status-pending"
-                            }
+                            className={eligible
+                              ? "status-chip status-submitted"
+                              : "status-chip status-pending"}
                           >
-                            {eligible
-                              ? "Eligible"
-                              : "Locked"}
+                            {eligible ? "Eligible" : "Locked"}
                           </span>
                         </td>
                       </tr>
@@ -1064,9 +1244,7 @@ function FinanceMonitoring({
 
                   {overview.byPsa.length === 0 && (
                     <tr>
-                      <td colSpan={7}>
-                        No PIP cards generated yet.
-                      </td>
+                      <td colSpan={6}>No PIP cards generated yet.</td>
                     </tr>
                   )}
                 </tbody>
@@ -1074,11 +1252,7 @@ function FinanceMonitoring({
             </div>
 
             <p className="muted">
-              Recount eligibility is currently shown
-              for monitoring. Actual recount requests
-              will only be enabled after Finance
-              reconciliation and backend eligibility
-              validation are implemented.
+              Request recounts by material in the Material Reconciliation panel below.
             </p>
           </>
         ) : (
@@ -1088,6 +1262,14 @@ function FinanceMonitoring({
               : "Finance audit progress is not available."}
           </p>
         )}
+      </section>
+
+      {/* MATERIAL RECONCILIATION */}
+      <section id="finance-material-reconciliation" className="panel">
+        <FinanceReconciliation
+          uploads={sapUploads}
+          cards={overview?.cards ?? []}
+        />
       </section>
     </div>
   );

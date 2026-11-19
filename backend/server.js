@@ -1323,6 +1323,7 @@ function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
 
   return {
     cardCount: cards.length,
+
     materialCount: materials.length,
     cards
   };
@@ -3182,86 +3183,57 @@ app.post(
 
 app.post(
   "/api/finance/upload-inventory",
-
-  // Only authorized Finance sessions
   requireFinance,
-
-  // Accept Excel file bytes
   express.raw({
     type: "application/octet-stream",
     limit: "15mb"
   }),
-
   async (req, res) => {
     try {
-      // -----------------------------
       // 1. Validate upload information
-      // -----------------------------
 
       const filename = path.basename(
         clean(req.headers["x-filename"] || "inventory.xlsx")
       );
-
-      const snapshotDate = clean(
-        req.headers["x-snapshot-date"]
-      );
-
-      const currency = clean(
-        req.headers["x-currency"]
-      ).toUpperCase();
+      const snapshotDate = clean(req.headers["x-snapshot-date"]);
+      const currency = clean(req.headers["x-currency"]).toUpperCase();
+      const cutoffDate = new Date(`${snapshotDate}T00:00:00Z`);
 
       if (!/^[A-Z]{3}$/.test(currency)) {
         return res.status(400).json({
-          message:
-            "Specify a valid three-letter currency, " +
-            "for example USD."
+          message: "Specify a valid three-letter currency, for example USD."
         });
       }
 
       if (
         !/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate) ||
-        Number.isNaN(
-          Date.parse(snapshotDate + "T00:00:00Z")
-        ) ||
-        new Date(snapshotDate + "T00:00:00Z")
-          .toISOString()
-          .slice(0, 10) !== snapshotDate
+        Number.isNaN(cutoffDate.getTime()) ||
+        cutoffDate.toISOString().slice(0, 10) !== snapshotDate
       ) {
         return res.status(400).json({
-          message:
-            "Enter a valid SAP inventory cutoff date " +
-            "in YYYY-MM-DD format."
+          message: "Enter a valid SAP inventory cutoff date in YYYY-MM-DD format."
         });
       }
 
-      if (
-        !Buffer.isBuffer(req.body) ||
-        req.body.length === 0
-      ) {
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
         return res.status(400).json({
           message: "Select an Excel file."
         });
       }
 
-      // -----------------------------
-      // 2. Read Excel workbook
-      // -----------------------------
+      // 2. Read the MB52 workbook
 
       const workbook = new ExcelJS.Workbook();
-
       await workbook.xlsx.load(req.body);
 
       const sheet = workbook.worksheets[0];
-
       if (!sheet) {
         return res.status(400).json({
           message: "Excel worksheet not found."
         });
       }
 
-      // -----------------------------
-      // 3. Detect Excel column headers
-      // -----------------------------
+      // 3. Detect MB52 column headers
 
       let headers = {};
       let headerRow = 0;
@@ -3273,31 +3245,16 @@ app.post(
       ) {
         const found = {};
 
-        sheet.getRow(rowNumber).eachCell(
-          (cell, columnNumber) => {
-            const key = normalize(readCell(cell));
-
-            if (key) {
-              found[key] = columnNumber;
-            }
-          }
-        );
+        sheet.getRow(rowNumber).eachCell((cell, columnNumber) => {
+          const key = normalize(readCell(cell));
+          if (key) found[key] = columnNumber;
+        });
 
         if (
           (found.material || found.materialnumber) &&
-          (
-            found.storagelocation ||
-            found.sloc ||
-            found.storageloc
-          ) &&
-          (
-            found.unrestricted ||
-            found.unrestrictedstock
-          ) &&
-          (
-            found.valueunrestricted ||
-            found.unrestrictedvalue
-          )
+          (found.storagelocation || found.sloc || found.storageloc) &&
+          found.totalquantity &&
+          found.totalvalue
         ) {
           headers = found;
           headerRow = rowNumber;
@@ -3308,16 +3265,14 @@ app.post(
       if (!headerRow) {
         return res.status(400).json({
           message:
-            "Unable to identify the required columns. " +
-            "Expected Material, Storage Location, " +
-            "Unrestricted, and Value Unrestricted."
+            "Expected MB52 columns: Material, Storage Location, " +
+            "Total Quantity, and Total Value."
         });
       }
 
       function findFinanceColumn(...names) {
         for (const name of names) {
           const column = headers[normalize(name)];
-
           if (column) return column;
         }
 
@@ -3325,38 +3280,14 @@ app.post(
       }
 
       const columns = {
-        material: findFinanceColumn(
-          "Material",
-          "Material Number"
-        ),
-
-        description: findFinanceColumn(
-          "Material Description",
-          "Description"
-        ),
-
-        sloc: findFinanceColumn(
-          "Storage Location",
-          "SLoc",
-          "Storage Loc"
-        ),
-
-        qty: findFinanceColumn(
-          "Unrestricted",
-          "Unrestricted Stock"
-        ),
-
-        value: findFinanceColumn(
-          "Value Unrestricted",
-          "Unrestricted Value"
-        )
+        material: findFinanceColumn("Material", "Material Number"),
+        description: findFinanceColumn("Material Description", "Description"),
+        sloc: findFinanceColumn("Storage Location", "SLoc", "Storage Loc"),
+        qty: findFinanceColumn("Total Quantity"),
+        value: findFinanceColumn("Total Value")
       };
 
-      // -----------------------------
       // 4. Read inventory rows
-      // -----------------------------
-
-      const inventory = [];
 
       function parseFinanceNumber(value) {
         if (typeof value === "number") {
@@ -3364,27 +3295,24 @@ app.post(
         }
 
         const original = clean(value);
-
         if (!original) return NaN;
 
-        const negative =
-          original.startsWith("(") &&
-          original.endsWith(")");
-
-        const normalized = original
+        const negative = original.startsWith("(") && original.endsWith(")");
+        const normalized = (negative ? original.slice(1, -1) : original)
           .replace(/,/g, "")
-          .replace(/^\(/, "")
-          .replace(/\)$/, "")
           .trim();
 
-        if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(normalized)) {
-          return NaN;
-        }
+        const numberPattern = negative
+          ? /^(?:\d+\.?\d*|\.\d+)$/
+          : /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
+
+        if (!numberPattern.test(normalized)) return NaN;
 
         const parsed = Number(normalized);
-
         return negative ? -parsed : parsed;
       }
+
+      const inventory = [];
 
       for (
         let rowNumber = headerRow + 1;
@@ -3392,50 +3320,29 @@ app.post(
         rowNumber++
       ) {
         const row = sheet.getRow(rowNumber);
+        const material = clean(getColumn(row, columns.material));
 
-        const material = clean(
-          getColumn(row, columns.material)
-        );
-
-        const sloc = clean(
-          getColumn(row, columns.sloc)
-        );
-
-        // Ignore empty rows and subtotal rows
-        // without a material number.
         if (!material) continue;
 
+        const sloc = clean(getColumn(row, columns.sloc));
         if (!sloc) {
-          throw new Error(
-            `Storage Location missing on row ${rowNumber}`
-          );
+          throw new Error(`Storage Location missing on row ${rowNumber}.`);
         }
 
-        const sapQty = parseFinanceNumber(
-          getColumn(row, columns.qty)
-        );
-
-        const sapValue = parseFinanceNumber(
-          getColumn(row, columns.value)
-        );
+        const sapQty = parseFinanceNumber(getColumn(row, columns.qty));
+        const sapValue = parseFinanceNumber(getColumn(row, columns.value));
 
         if (!Number.isFinite(sapQty)) {
-          throw new Error(
-            `Invalid SAP quantity on row ${rowNumber}`
-          );
+          throw new Error(`Invalid Total Quantity on row ${rowNumber}.`);
         }
 
         if (!Number.isFinite(sapValue)) {
-          throw new Error(
-            `Invalid SAP inventory value on row ${rowNumber}`
-          );
+          throw new Error(`Invalid Total Value on row ${rowNumber}.`);
         }
 
         inventory.push({
           material,
-          description: clean(
-            getColumn(row, columns.description)
-          ),
+          description: clean(getColumn(row, columns.description)),
           sloc,
           sap_qty: sapQty,
           sap_value: sapValue,
@@ -3443,16 +3350,13 @@ app.post(
         });
       }
 
-      if (inventory.length === 0) {
+      if (!inventory.length) {
         return res.status(400).json({
-          message:
-            "No valid inventory materials found."
+          message: "No valid inventory materials found."
         });
       }
 
-      // -----------------------------
-      // 5. Save Finance upload
-      // -----------------------------
+      // 5. Save the Finance upload
 
       await ensureFinanceTables();
 
@@ -3460,11 +3364,12 @@ app.post(
       const pool = await getSqlPool();
       const transaction = new sql.Transaction(pool);
       await transaction.begin();
+
       try {
         const uploadResult = await new sql.Request(transaction)
           .input("filename", sql.NVarChar(260), filename)
           .input("uploadedBy", sql.NVarChar(128), req.session.user.username)
-          .input("snapshotDate", sql.Date, new Date(`${snapshotDate}T00:00:00Z`))
+          .input("snapshotDate", sql.Date, cutoffDate)
           .query(`
             INSERT INTO INV.FinanceUploads (
               Filename,
@@ -3480,6 +3385,7 @@ app.post(
 
         const inventoryTable = new sql.Table("INV.FinanceInventory");
         inventoryTable.create = false;
+
         inventoryTable.columns.add("UploadID", sql.Int, { nullable: false });
         inventoryTable.columns.add("Material", sql.NVarChar(100), { nullable: false });
         inventoryTable.columns.add("Description", sql.NVarChar(sql.MAX), { nullable: false });
@@ -3507,14 +3413,7 @@ app.post(
         throw error;
       }
 
-      // -----------------------------
-      // 6. Return upload summary
-      // -----------------------------
-
-      const totalValue = inventory.reduce(
-        (sum, item) => sum + item.sap_value,
-        0
-      );
+      // 6. Return the upload summary
 
       res.json({
         success: true,
@@ -3523,67 +3422,308 @@ app.post(
         snapshotDate,
         currency,
         materials: inventory.length,
-        totalValue
+        totalValue: inventory.reduce((sum, item) => sum + item.sap_value, 0)
       });
-
     } catch (error) {
-      console.error(
-        "Finance upload error:",
-        error.message
-      );
-
-      res.status(error.code ? 500 : 400).json({
-        message: error.message
-      });
+      console.error("Finance upload error:", error.message);
+      res.status(error.code ? 500 : 400).json({ message: error.message });
     }
   }
 );
-
 
 /* =========================================
    FINANCE UPLOAD HISTORY
 ========================================= */
 
-app.get(
-  "/api/finance/uploads",
-  requireFinance,
-  async (req, res) => {
-    try {
-      await ensureFinanceTables();
-      const pool = await getSqlPool();
-      const result = await pool.request().query(`
+app.get("/api/finance/uploads", requireFinance, async (req, res) => {
+  try {
+    await ensureFinanceTables();
+
+    const pool = await getSqlPool();
+    const result = await pool.request().query(`
+      SELECT
+        u.ID AS id,
+        u.Filename AS filename,
+        u.UploadedBy AS uploaded_by,
+        u.UploadedAt AS uploaded_at,
+        u.SnapshotDate AS snapshot_date,
+        u.Status AS status,
+        COUNT(i.ID) AS materials,
+        SUM(i.SapValue) AS total_value,
+        MIN(i.Currency) AS currency
+      FROM INV.FinanceUploads u
+      LEFT JOIN INV.FinanceInventory i ON i.UploadID = u.ID
+      GROUP BY
+        u.ID, u.Filename, u.UploadedBy, u.UploadedAt, u.SnapshotDate, u.Status
+      ORDER BY u.ID DESC
+    `);
+
+    res.json(result.recordset);
+  } catch (error) {
+    console.error("Finance upload history load failed:", error.message);
+    res.status(503).json({
+      message: "Unable to load Finance upload history from SQL Server"
+    });
+  }
+});
+
+/* =========================================
+   FINANCE MATERIAL RECONCILIATION
+========================================= */
+
+const financePips = `
+  SELECT
+    PIPNum,
+    LOWER(LTRIM(RTRIM(COALESCE(Status, '')))) AS status,
+    COALESCE(
+      NULLIF(LTRIM(RTRIM(Area)), ''),
+      NULLIF(LTRIM(RTRIM(SubArea)), ''),
+      'Unassigned'
+    ) AS area
+  FROM INV.PIP
+  WHERE PIPNum LIKE 'PIP-' + @sloc + '-%'
+`;
+
+async function readFinanceReconciliation(
+  connection,
+  sloc,
+  uploadId,
+  psa,
+  material = null
+) {
+  const sapQuery = uploadId === null
+    ? `
+      SELECT
+        CAST(NULL AS NVARCHAR(100)) AS material,
+        CAST(NULL AS DECIMAL(28, 8)) AS sap_qty,
+        CAST(NULL AS DECIMAL(28, 8)) AS sap_cost,
+        CAST(NULL AS CHAR(3)) AS currency
+      WHERE 1 = 0
+    `
+    : `
+      SELECT
+        Material AS material,
+        SUM(SapQty) AS sap_qty,
+        SUM(SapValue) AS sap_cost,
+        MIN(Currency) AS currency
+      FROM INV.FinanceInventory
+      WHERE UploadID = @uploadId
+        AND SLoc = @sloc
+        AND (@material IS NULL OR Material = @material)
+      GROUP BY Material
+    `;
+
+  const result = await connection.request()
+    .input("sloc", sql.NVarChar(16), sloc)
+    .input("psa", sql.NVarChar(256), psa)
+    .input("uploadId", sql.Int, uploadId)
+    .input("material", sql.NVarChar(100), material)
+    .query(`
+      WITH Pips AS (${financePips}),
+      IncompleteAreas AS (
+        SELECT DISTINCT area
+        FROM Pips
+        WHERE status NOT IN ('confirmed', 'rc pending')
+      ),
+      Tickets AS (
         SELECT
-          u.ID AS id,
-          u.Filename AS filename,
-          u.UploadedBy AS uploaded_by,
-          u.UploadedAt AS uploaded_at,
-          u.SnapshotDate AS snapshot_date,
-          u.Status AS status,
-          COUNT(i.ID) AS materials,
-          SUM(i.SapValue) AS total_value,
-          MIN(i.Currency) AS currency
-        FROM INV.FinanceUploads u
-        LEFT JOIN INV.FinanceInventory i
-          ON i.UploadID = u.ID
-        GROUP BY
-          u.ID,
-          u.Filename,
-          u.UploadedBy,
-          u.UploadedAt,
-          u.SnapshotDate,
-          u.Status
-        ORDER BY u.ID DESC
+          t.PIPNum,
+          t.TicketNumber,
+          p.area,
+          LTRIM(RTRIM(t.Material)) AS material,
+          LOWER(LTRIM(RTRIM(COALESCE(t.Status, '')))) AS status,
+          p.status AS pip_status,
+          COALESCE(t.Recount, 0) AS recount,
+          CASE WHEN i.area IS NULL THEN 0 ELSE 1 END AS incomplete_area
+        FROM Pips p
+        JOIN INV.Tickets t ON t.PIPNum = p.PIPNum
+        LEFT JOIN IncompleteAreas i ON i.area = p.area
+        WHERE NULLIF(LTRIM(RTRIM(t.Material)), '') IS NOT NULL
+          AND LOWER(LTRIM(RTRIM(COALESCE(t.Status, '')))) <> 'voided'
+          AND LOWER(LTRIM(RTRIM(COALESCE(t.TypeOfAdd, 'cancelled'))))
+              NOT IN ('po', 'cancelled')
+          AND (@material IS NULL OR LTRIM(RTRIM(t.Material)) = @material)
+      ),
+      ActiveCounts AS (
+        SELECT
+          PI_Card,
+          TicketNumber,
+          LTRIM(RTRIM(Material)) AS material,
+          COUNT(*) AS row_count,
+          MAX(PI_Card_Qty) AS qty,
+          MAX(MaterialCost) AS cost
+        FROM INV.BOM_Complex_Catalog
+        WHERE PI_Card LIKE 'PIP-' + @sloc + '-%'
+          AND LOWER(LTRIM(RTRIM(COALESCE(Status, ''))))
+              NOT IN ('cancelled', 'canceled')
+          AND (@material IS NULL OR LTRIM(RTRIM(Material)) = @material)
+        GROUP BY PI_Card, TicketNumber, LTRIM(RTRIM(Material))
+      ),
+      Audited AS (
+        SELECT
+          t.material,
+          SUM(CASE WHEN c.row_count = 1 THEN c.qty END) AS counted_qty,
+          SUM(CASE WHEN c.row_count = 1 THEN c.cost END) AS counted_cost,
+          MAX(t.recount) AS requested,
+          MAX(CASE
+            WHEN t.incomplete_area = 1
+              OR t.pip_status <> 'confirmed'
+              OR t.status NOT IN ('confirmed', 'rc confirmed')
+              OR COALESCE(c.row_count, 0) <> 1
+              OR c.qty IS NULL
+            THEN 1 ELSE 0
+          END) AS blocked
+        FROM Tickets t
+        LEFT JOIN ActiveCounts c ON c.PI_Card = t.PIPNum
+          AND c.TicketNumber = t.TicketNumber
+          AND c.material = t.material
+          AND t.status IN ('confirmed', 'rc confirmed', 'rc pending')
+          AND t.pip_status IN ('confirmed', 'rc pending')
+        WHERE t.area = @psa
+        GROUP BY t.material
+        HAVING MAX(CASE
+          WHEN t.pip_status IN ('confirmed', 'rc pending')
+            AND t.status IN ('confirmed', 'rc confirmed', 'rc pending')
+          THEN 1 ELSE 0
+        END) = 1
+      ),
+      Sap AS (${sapQuery})
+      SELECT
+        a.material,
+        a.counted_qty,
+        a.counted_cost,
+        s.sap_qty,
+        s.sap_cost,
+        s.currency,
+        COALESCE(a.requested, 0) AS requested,
+        CASE
+          WHEN a.blocked = 0
+            AND a.requested = 0
+            AND a.counted_qty <> s.sap_qty
+          THEN 1 ELSE 0
+        END AS can_recount
+      FROM Audited a
+      LEFT JOIN Sap s ON s.material = a.material
+        AND NOT EXISTS (
+          SELECT 1
+          FROM Tickets other
+          WHERE other.material = a.material AND other.area <> @psa
+        )
+      ORDER BY a.material
+    `);
+
+  return result.recordset;
+}
+
+app.get("/api/finance/reconciliation", requireFinance, async (req, res) => {
+  const sloc = clean(req.query.sloc);
+  const psa = clean(req.query.psa);
+  const rawUploadId = clean(req.query.uploadId);
+  const uploadId = rawUploadId === "" ? null : Number(rawUploadId);
+
+  if (!LOCATIONS.includes(sloc) || !psa || psa.length > 256) {
+    return res.status(400).json({
+      message: "Select a valid Production Supply Area."
+    });
+  }
+
+  if (
+    uploadId !== null &&
+    (!Number.isSafeInteger(uploadId) || uploadId < 1 || uploadId > 2147483647)
+  ) {
+    return res.status(400).json({ message: "Select a valid SAP upload." });
+  }
+
+  try {
+    if (uploadId !== null) await ensureFinanceTables();
+
+    const pool = await getSqlPool();
+    const materials = await readFinanceReconciliation(pool, sloc, uploadId, psa);
+
+    res.json(materials);
+  } catch (error) {
+    console.error("Finance reconciliation failed:", error.message);
+    res.status(503).json({ message: "Unable to load material reconciliation." });
+  }
+});
+
+app.post("/api/finance/reconciliation/recount", requireFinance, async (req, res) => {
+  const sloc = clean(req.body?.sloc);
+  const psa = clean(req.body?.psa);
+  const uploadId = Number(req.body?.uploadId);
+  const material = clean(req.body?.material);
+
+  if (
+    !LOCATIONS.includes(sloc) ||
+    !psa ||
+    psa.length > 256 ||
+    !Number.isSafeInteger(uploadId) ||
+    uploadId < 1 ||
+    uploadId > 2147483647 ||
+    !material ||
+    material.length > 100
+  ) {
+    return res.status(400).json({ message: "Invalid recount request." });
+  }
+
+  let transaction;
+
+  try {
+    await ensureFinanceTables();
+
+    transaction = new sql.Transaction(await getSqlPool());
+    await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+
+    const [row] = await readFinanceReconciliation(
+      transaction, sloc, uploadId, psa, material
+    );
+
+    if (row?.can_recount !== 1) {
+      await transaction.rollback();
+      return res.status(409).json({
+        message: "This material is no longer eligible for recount. Refresh the table."
+      });
+    }
+
+    const result = await transaction.request()
+      .input("sloc", sql.NVarChar(16), sloc)
+      .input("psa", sql.NVarChar(256), psa)
+      .input("material", sql.NVarChar(100), material)
+      .query(`
+        WITH Pips AS (${financePips})
+        UPDATE t
+        SET Recount = 1
+        FROM INV.Tickets t
+        JOIN Pips p ON p.PIPNum = t.PIPNum
+        WHERE p.status = 'confirmed'
+          AND p.area = @psa
+          AND LTRIM(RTRIM(t.Material)) = @material
+          AND LOWER(LTRIM(RTRIM(COALESCE(t.Status, ''))))
+              IN ('confirmed', 'rc confirmed')
+          AND LOWER(LTRIM(RTRIM(COALESCE(t.TypeOfAdd, 'cancelled'))))
+              NOT IN ('po', 'cancelled')
+          AND COALESCE(t.Recount, 0) = 0
       `);
 
-      res.json(result.recordset);
-    } catch (error) {
-      console.error("Finance upload history load failed:", error.message);
-      res.status(503).json({ message: "Unable to load Finance upload history from SQL Server" });
-    }
+    await transaction.commit();
+
+    const tickets = result.rowsAffected[0];
+    void writeLog({
+      activity: "finance_recount_requested",
+      userName: req.session.user.username,
+      message: `${material} at ${psa} (${sloc}) | SAP upload ${uploadId} | ${tickets} ticket(s)`
+    });
+
+    res.json({ tickets });
+  } catch (error) {
+    if (transaction) await transaction.rollback().catch(() => {});
+
+    console.error("Finance recount request failed:", error.message);
+    res.status(503).json({ message: "Unable to request recount." });
   }
-);
+});
 
-
+      
 // 4. Protected Finance workspace
 app.get(
   "/api/finance/workspace",
