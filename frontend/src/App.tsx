@@ -3523,7 +3523,7 @@ function App() {
                           const isBlank =
                             selectedCard.kind === "blank";
                           const isReadOnly = Boolean(
-                            (selectedCard.submitted_at && !selectedCard.is_recount) || line.line_no !== 1
+                            (selectedCard.submitted_at && !selectedCard.is_recount) || (selectedCard.kind === "blank" && line.line_no !== 1)
                           );
                           const isRecountLine =
                             Number(line.recount) === 1 &&
