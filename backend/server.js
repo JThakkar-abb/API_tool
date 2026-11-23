@@ -19,7 +19,14 @@ const PORT = 3001;
 const LOCATIONS = ["1000", "2000", "3000", "5000"];
 
 app.use(cors({
-  origin: "http://localhost:5173",
+  origin(origin, callback) {
+    if (!origin || !IS_PRODUCTION) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error("Origin not allowed"));
+  },
   credentials: true
 }));
 
@@ -1314,7 +1321,7 @@ function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
         uom: material.uom,
         sap_qty: material.sap_qty,
         physical_qty: null,
-        is_void: 0
+        is_void: material.material.length === 0 ? 1 : 0
       }));
 
       cards.push({ code, kind: "filled", lines });

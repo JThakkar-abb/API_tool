@@ -44,6 +44,8 @@ type MaterialLine = {
   status?: string | null;
   recount?: number | boolean | null;
   is_void: number;
+  counted_qty: number | null;
+
 };
 
 type PipCard = {
@@ -106,6 +108,26 @@ type FinanceUpload = {
   currency: string | null;
 };
 
+type FinanceMaterial = {
+  id: number;
+  material: string;
+  description: string;
+  bin: string;
+  location_type?: string;
+  plant: string;
+  stock_category: string;
+  batch: string;
+  uom: string;
+  sap_qty: number | null;
+  counted_qty: number | null;
+  sap_cost: number | null;
+  counted_cost: number | null;
+  total_value: number | 0;
+  currency: string | null;
+  requested: number | 0;
+  can_recount: number;
+};
+
 type ManagerTab = "overview" | "cards" | "finance";
 
 const STORAGE_LOCATIONS = ["1000", "2000", "3000"];
@@ -118,8 +140,9 @@ async function api(
   endpoint: string,
   options: RequestInit = {}
 ) {
-  const response = await fetch(`/api${endpoint}`, {
+  const response = await fetch(`http://localhost:3001/api${endpoint}`, {
     credentials: "same-origin",
+    mode: "cors",
     ...options
   });
 
@@ -799,7 +822,7 @@ function FinanceReconciliation({
     if (counted === sap) return "0.0%";
     if (sap === 0) return "N/A";
 
-    const percentage = ((counted - sap) / Math.abs(sap)) * 100;
+    const percentage = ((counted ?? 0) - (sap ?? 0)) / Math.abs(sap ?? 0.01) * 100;
     return `${percentage > 0 ? "+" : ""}${percentage.toFixed(1)}%`;
   }
 
