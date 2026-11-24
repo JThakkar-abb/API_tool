@@ -140,9 +140,8 @@ async function api(
   endpoint: string,
   options: RequestInit = {}
 ) {
-  const response = await fetch(`http://localhost:3001/api${endpoint}`, {
-    credentials: "same-origin",
-    mode: "cors",
+  const response = await fetch(`/api${endpoint}`, {
+    credentials: "include",
     ...options
   });
 
@@ -245,7 +244,7 @@ function PipCardSheet({
     <article className="pip-sheet">
       <div className="pip-sheet-header">
         <div className="pip-sheet-logo">
-          <img src="/OIP.webp" alt="ABB Logo" />
+          <img src="./OIP.webp" alt="ABB Logo" />
         </div>
 
         <div className="pip-sheet-title">
@@ -1862,13 +1861,9 @@ function App() {
         await api("/login", {
           method: "POST",
           headers: {
-            "Content-Type":
-              "application/json"
+            "Content-Type": "application/json"
           },
-          body: JSON.stringify({
-            username,
-            password
-          })
+          body: JSON.stringify({})
         });
 
       setUser(result);
@@ -2595,7 +2590,7 @@ function App() {
             <main className="login-screen">
               <form className="login-box" onSubmit={login}>
                 <img
-                  src="/OIP.webp"
+                  src="./OIP.webp"
                   alt="ABB Logo"
                   className="login-logo"
                 />
@@ -2663,7 +2658,7 @@ function App() {
     <main className="login-screen">
       <form className="login-box" onSubmit={login}>
         <img
-          src="/OIP.webp"
+          src="./OIP.webp"
           alt="ABB Logo"
           className="login-logo"
         />
@@ -2728,7 +2723,7 @@ function App() {
       <aside className="sidebar">
         <div className="sidebar-brand">
           <img
-            src="/OIP.webp"
+            src="./OIP.webp"
             alt="ABB Logo"
           />
 

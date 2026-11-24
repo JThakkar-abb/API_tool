@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
+    "start": "npm --prefix ../frontend run build && set NODE_ENV=production && node server.js",
+    "dev": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -19,7 +19,8 @@
     "exceljs": "^4.4.0",
     "express": "^5.3.0",
     "express-session": "^1.19.0",
-    "mssql": "^12.7.13"
+    "mssql": "^12.7.13",
+    "node-expose-sspi": "^0.1.60"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

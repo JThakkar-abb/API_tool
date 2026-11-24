@@ -6,6 +6,7 @@ const bcrypt = require("bcryptjs");
 const ExcelJS = require("exceljs");
 const sql = require("mssql");
 const path = require("node:path");
+const { sso } = require("node-expose-sspi");
 const { getSqlPool } = require("./sqlConnection");
 const sqlQueries = require("./mssql/queries.js");
 
@@ -19,14 +20,9 @@ const PORT = 3001;
 const LOCATIONS = ["1000", "2000", "3000", "5000"];
 
 app.use(cors({
-  origin(origin, callback) {
-    if (!origin || !IS_PRODUCTION) {
-      callback(null, true);
-      return;
-    }
-
-    callback(new Error("Origin not allowed"));
-  },
+  origin: IS_PRODUCTION
+    ? false
+    : `http://localhost:5173`,
   credentials: true
 }));
 
@@ -277,7 +273,11 @@ const localUsers = !IS_PRODUCTION
 
 function getIisWindowsIdentity(req) {
   const identity =
+    req.sso?.user?.name ||
     req.headers["x-iis-windows-user"] ||
+    req.headers["http-x-iis-windows-user"] ||
+    req.headers["http-auth-user"] ||
+    req.headers["http-logon-user"] ||
     req.headers["x-iisnode-auth_user"] ||
     req.headers["x-iisnode-logon_user"] ||
     req.headers["x-iisnode-remote_user"] ||
@@ -1334,6 +1334,19 @@ function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
     materialCount: materials.length,
     cards
   };
+}
+
+if (IS_PRODUCTION) {
+  app.use("/api/login", (req, res, next) => {
+    const stableClientIp = req.socket.remoteAddress || "browser";
+    req.headers["x-real-ip"] = stableClientIp;
+    req.headers["x-forwarded-for"] = stableClientIp;
+    req.headers["connection"] = "keep-alive";
+    next();
+  }, sso.auth({
+    useSession: true,
+    forceNTLM: true
+  }));
 }
 
 app.post("/api/login", async (req, res) => {
@@ -3745,25 +3758,31 @@ app.get(
 
 const frontendDist = path.resolve(__dirname, "..", "frontend", "dist");
 
-if (IS_PRODUCTION) {
-  app.use(express.static(frontendDist));
+app.use("/assets", express.static(path.join(frontendDist, "assets"), {
+  immutable: true,
+  maxAge: "1y"
+}));
 
-  app.use((req, res, next) => {
-    if (req.method !== "GET") return next();
+app.use(express.static(frontendDist, {
+  extensions: ["html"],
+  maxAge: "1h"
+}));
 
-    const accept = String(req.headers.accept || "");
-    if (!accept.includes("text/html")) return next();
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/") || req.method !== "GET") {
+    return next();
+  }
 
-    res.sendFile(path.join(frontendDist, "index.html"), error => {
-      if (error) next(error);
-    });
+  res.sendFile(path.join(frontendDist, "index.html"), error => {
+    if (error) next(error);
   });
-}
+});
 
+const listenHost = process.env.HOST || "0.0.0.0";
 const listenPort = process.env.PORT || PORT;
 
-app.listen(listenPort, () => {
+app.listen(listenPort, listenHost, () => {
   console.log(
-    `ABB PIP Audit backend running on port ${listenPort}`
+    `ABB PIP Audit backend running at http://${listenHost}:${listenPort}`
   );
 });
