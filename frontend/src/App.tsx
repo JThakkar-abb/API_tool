@@ -25,6 +25,7 @@ type Batch = {
   area: string;
   area_id: number | null;
   created_at: string;
+  leaders: [];
 };
 
 type MaterialLine = {
@@ -59,6 +60,8 @@ type PipCard = {
   is_recount?: boolean;
   status?: string | null;
   submitted_at?: string | null;
+  aliasAssigned?: string | null;
+  auditor_alias?: string | null;
   lines: MaterialLine[];
 };
 
@@ -236,6 +239,12 @@ function PipCardSheet({
   const isSubmitted = !!card.submitted_at;
   const isRecountPending =
     String(card.status || "").trim().toLowerCase() === "rc pending";
+  const leaderName = (card.leaders || [])
+    .find(leader => leader.role === "Inventory Leader")?.name || "";
+  const auditorName = (card.leaders || [])
+    .find(leader => leader.role === "AuditLeader")?.name ||
+    (card.leaders || [])
+      .find(leader => leader.role === "Audit Leader")?.name || "";
   const rows = card.is_recount
     ? card.lines
     : Array.from({ length: 10 }, (_, index) => card.lines[index] ?? null);
@@ -368,13 +377,13 @@ function PipCardSheet({
 
       <div className="pip-signature-section">
         <div className="signature-box">
-          <strong>Auditor Signature</strong>
+          <strong>Auditor Signature: {auditorName || "________________"}</strong>
           <div className="signature-line"></div>
           <span>Date: __________________</span>
         </div>
 
         <div className="signature-box">
-          <strong>Leader Signature</strong>
+          <strong>Leader Signature: {leaderName || "________________"}</strong>
           <div className="signature-line"></div>
           <span>Date: __________________</span>
         </div>
@@ -1863,7 +1872,10 @@ function App() {
           headers: {
             "Content-Type": "application/json"
           },
-          body: JSON.stringify({})
+          body: JSON.stringify({
+            username,
+            password
+          })
         });
 
       setUser(result);
@@ -2595,10 +2607,10 @@ function App() {
                   className="login-logo"
                 />
 
-                <h1>Warehouse Inventory Audit</h1>
+                <h1>ABB Inventory Audit</h1>
 
                 <p className="muted">
-                  ABB Internal Inventory Management
+                  Internal Inventory Management
                 </p>
 
                 <label>Username</label>

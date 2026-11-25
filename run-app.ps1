@@ -52,7 +52,7 @@ if ($Mode -eq "development") {
 Write-Host "Starting production app..."
 Push-Location $Backend
 $env:NODE_ENV = "production"
-$env:HOST = "0.0.0.0"
+$env:HOST = "127.0.0.1"
 $env:PORT = "3001"
-node server.js
+node index.js
 Pop-Location

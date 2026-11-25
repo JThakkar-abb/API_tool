@@ -6,18 +6,18 @@ const bcrypt = require("bcryptjs");
 const ExcelJS = require("exceljs");
 const sql = require("mssql");
 const path = require("node:path");
-const { sso } = require("node-expose-sspi");
-const { getSqlPool } = require("./sqlConnection");
+const { getSqlPool } = require("./sqlConnection.js");
 const sqlQueries = require("./mssql/queries.js");
 
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
-const app = express();
 const IS_PRODUCTION =
   process.env.NODE_ENV === "production" ||
   !!process.env.IISNODE_VERSION;
 const PORT = 3001;
 const LOCATIONS = ["1000", "2000", "3000", "5000"];
+
+const app = express();
 
 app.use(cors({
   origin: IS_PRODUCTION
@@ -249,31 +249,30 @@ app.use(session({
   }
 }));
 
-
-const localUsers = !IS_PRODUCTION
-  ? [
-      {
-        username: "manager",
-        role: "manager",
-        hash: bcrypt.hashSync(
-          process.env.MANAGER_PASSWORD,
-          10
-        )
-      },
-      {
-        username: "auditor",
-        role: "auditor",
-        hash: bcrypt.hashSync(
-          process.env.AUDITOR_PASSWORD,
-          10
-        )
-      }
-    ]
-  : [];
-
+const localUsers = [
+  {
+    username: "manager",
+    role: "manager",
+    hash: bcrypt.hashSync(
+      process.env.MANAGER_PASSWORD,
+      10
+    )
+  },
+  {
+    username: "auditor",
+    role: "auditor",
+    hash: bcrypt.hashSync(
+      process.env.AUDITOR_PASSWORD,
+      10
+    )
+  }
+];
 function getIisWindowsIdentity(req) {
+  if (!IS_PRODUCTION && !process.env.IIS_IDENTITY_SOURCE) {
+    return "";
+  }
+
   const identity =
-    req.sso?.user?.name ||
     req.headers["x-iis-windows-user"] ||
     req.headers["http-x-iis-windows-user"] ||
     req.headers["http-auth-user"] ||
@@ -362,7 +361,7 @@ function requireFinance(req, res, next) {
 
 function requireLogin(req, res, next) {
   if (!req.session.user) {
-    return res.status(401).json({
+    return res.status(403).json({
       message: "Please sign in"
     });
   }
@@ -547,6 +546,8 @@ async function getCard(code) {
       kind: generatedCard.kind || "filled",
       area_id: generatedCard.area_id || null,
       leaders: generatedCard.leaders || [],
+      aliasAssigned: generatedCard.aliasAssigned || null,
+      auditor_alias: generatedCard.aliasAssigned || null,
       is_recount: !!generatedCard.is_recount
     };
   }
@@ -1280,7 +1281,7 @@ async function fetchProductionAreaMaterials(location, areaId) {
   };
 }
 
-function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
+function createCardsFromMaterials({ batchId, sloc, areaId, materials, leaders }) {
   const cards = [];
   const materialsByLocation = new Map();
 
@@ -1297,6 +1298,12 @@ function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
     group.push(material);
     materialsByLocation.set(locationKey, group);
   }
+
+  // for(const leader of leaders){
+  //   const owner = clean(leader.leader);
+  //   const inventoryLeader = clean(leader.inventoryLeader);
+  //   const auditLeader = clean(leader.auditLeader);
+  // }
 
   let pageNumber = 0;
   for (const locationMaterials of materialsByLocation.values()) {
@@ -1334,19 +1341,6 @@ function createCardsFromMaterials({ batchId, sloc, areaId, materials }) {
     materialCount: materials.length,
     cards
   };
-}
-
-if (IS_PRODUCTION) {
-  app.use("/api/login", (req, res, next) => {
-    const stableClientIp = req.socket.remoteAddress || "browser";
-    req.headers["x-real-ip"] = stableClientIp;
-    req.headers["x-forwarded-for"] = stableClientIp;
-    req.headers["connection"] = "keep-alive";
-    next();
-  }, sso.auth({
-    useSession: true,
-    forceNTLM: true
-  }));
 }
 
 app.post("/api/login", async (req, res) => {
@@ -1397,7 +1391,7 @@ app.post("/api/login", async (req, res) => {
       });
     }
   } else {
-    return res.status(401).json({
+    return res.status(403).json({
       message: "Windows authentication is required"
     });
   }
@@ -2205,7 +2199,7 @@ app.post(
 app.get(
   "/api/batches/:id/cards",
   requireManager,
-  (req, res) => {
+  async (req, res) => {
     const batch = getGeneratedBatch(Number(req.params.id));
 
     if (!batch) {
@@ -3154,7 +3148,7 @@ app.post(
     );
 
     if (!valid) {
-      return res.status(401).json({
+      return res.status(403).json({
         message: "Incorrect Finance password"
       });
     }
@@ -3778,7 +3772,7 @@ app.use((req, res, next) => {
   });
 });
 
-const listenHost = process.env.HOST || "0.0.0.0";
+const listenHost = process.env.HOST || "127.0.0.1";
 const listenPort = process.env.PORT || PORT;
 
 app.listen(listenPort, listenHost, () => {
